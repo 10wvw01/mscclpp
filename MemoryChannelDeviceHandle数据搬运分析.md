@@ -131,7 +131,7 @@ MemoryChannelDeviceHandle
 
 ## 3.2 `src_`
 
-`src_` 通常是当前 GPU 的本地普通数据地址：
+`src_` 通常是当前 GPU 本地的普通数据地址：
 
 - `put()` 从 `src_` 读取，再写入 `dst_`；
 - `get()` 从 `dst_` 读取，再写入 `src_`；
@@ -152,7 +152,7 @@ MemoryChannelDeviceHandle
 
 > 对发送端来说，接收端的 Packet Buffer 表现为发送端句柄里的远端 `dst_`；对接收端自己来说，同一块物理内存表现为本地 `packetBuffer_`。
 
-后文第 14 节会专门画图说明这一点。
+后文第 14 节会把发送端和接收端连在一张图中说明。
 
 ---
 
@@ -508,44 +508,93 @@ Packet 协议把小粒度的“数据”和“到达标志”放在同一个 Pac
 - 普通 `put()`：先送包裹，再单独打电话说“包裹到了”；
 - `putPackets()`：每个包裹上都贴有本轮批次号，收件人看到正确批次号才拆包。
 
-## 14.2 最关键的地址关系
+## 14.2 发送端和接收端连在一起的完整主图
 
-假设 GPU 0 向 GPU 1 发送 Packet。
-
-同一块位于 GPU 1 HBM 的 Packet Buffer，在两端的视角不同：
+假设 GPU 0 向 GPU 1 发送 Packet。下面这张图把发送端、互联、接收端、轮询和最终解包目标连成一条完整链路：
 
 ```mermaid
 flowchart LR
-    subgraph G0[GPU 0 发送端视角]
-        A[src_<br/>本地普通数据]
-        B[dst_<br/>映射后的远端地址]
+    subgraph SEND[GPU 0 发送端]
+        S0[HBM 中的本地 src_<br/>普通 Payload]
+        S1[GPU 0 SM<br/>线程寄存器]
+        S2[copyToPackets<br/>组合 Payload + flag]
+        S0 -->|Global Load| S1
+        S1 --> S2
     end
 
-    subgraph G1[GPU 1 接收端视角]
-        C[packetBuffer_<br/>本地 Packet Buffer]
-        D[src_<br/>本地解包目标]
+    S2 -->|st.volatile.global<br/>写发送端句柄的 remote dst_| LINK[NVLink / NVSwitch / PCIe P2P]
+
+    LINK --> PBUF[GPU 1 HBM 中的同一块 Packet Buffer<br/>发送端视角：remote dst_<br/>接收端视角：local packetBuffer_]
+
+    subgraph RECV[GPU 1 接收端]
+        R1[GPU 1 SM<br/>ld.volatile.global 读取 Packet]
+        R2{Flag 等于<br/>expectedFlag?}
+        R3[提取 Payload<br/>进入 GPU 1 线程寄存器]
+        R4[HBM 中的本地 src_<br/>普通解包结果]
+        R1 --> R2
+        R2 -- 是 --> R3
+        R3 -->|普通 Global Store| R4
     end
 
-    B -.指向同一块物理内存.-> C
-    A --> B
-    C --> D
+    PBUF --> R1
+    R2 -- 否：继续轮询 --> PBUF
 ```
 
-必须记住：
+这张图必须从左到右连起来理解：
 
-> 发送端句柄里的 `dst_`，可以指向接收端的 Packet Buffer；接收端句柄里的 `packetBuffer_`，则是这块内存的本地地址。
+```text
+GPU 0 本地 src_
+→ GPU 0 SM 读取 Payload
+→ 加入 Flag，形成 Packet
+→ 对远端 dst_ 发出 Volatile Global Store
+→ NVLink / NVSwitch / PCIe P2P
+→ GPU 1 HBM 中的 Packet Buffer
+→ GPU 1 SM 反复 Volatile Load 并检查 Flag
+→ Flag 匹配后提取 Payload
+→ 写入 GPU 1 本地 src_
+```
 
-也就是说：
+最关键的地址关系是：
 
 ```text
 发送端看到：remote dst_
 接收端看到：local packetBuffer_
-物理位置：接收端 GPU 的 HBM
+物理位置：GPU 1 HBM 中的同一块 Packet Buffer
 ```
 
-这不是两份 Packet Buffer，而是对同一块物理内存的两个访问视角。
+> `remote dst_` 和 `local packetBuffer_` 不是两块内存，也不是还需要额外复制一次；它们是同一块接收端物理缓冲区在两张 GPU 地址空间中的不同视图。
 
-## 14.3 LL16Packet 的布局
+## 14.3 端到端时序图
+
+主图描述空间上的数据路径，下面的时序图描述时间上的先后关系：
+
+```mermaid
+sequenceDiagram
+    participant SData as GPU 0 本地 src_
+    participant SSM as GPU 0 SM
+    participant Link as NVLink / PCIe P2P
+    participant PBuf as GPU 1 Packet Buffer
+    participant RSM as GPU 1 SM
+    participant RData as GPU 1 本地 src_
+
+    RSM->>PBuf: ld.volatile.global 读取 Packet
+    PBuf-->>RSM: 返回旧 Flag / 未完成状态
+    RSM->>PBuf: 继续轮询
+
+    SSM->>SData: Global Load 读取 Payload
+    SData-->>SSM: Payload 进入寄存器
+    SSM->>SSM: 组合 Payload + 当前 flag
+    SSM->>Link: st.volatile.global 写远端 Packet
+    Link->>PBuf: Packet 到达 GPU 1 HBM
+
+    RSM->>PBuf: 再次读取 Packet
+    PBuf-->>RSM: Payload + 匹配的 Flag
+    RSM->>RData: Global Store 写入解包 Payload
+```
+
+这里允许接收端先开始轮询。它不需要知道远端写请求在哪一个周期到达，只需要等待 Flag 变成目标值。
+
+## 14.4 LL16Packet 的布局
 
 源码中的 `LL16Packet` 总大小为 16B：
 
@@ -586,7 +635,7 @@ Payload 效率：50%
 
 源码注释假设底层至少提供 8B 写入原子性。两个 Flag 的目的，是帮助接收端识别 16B Packet 是否只更新了一半。
 
-## 14.4 LL8Packet 的布局
+## 14.5 LL8Packet 的布局
 
 `LL8Packet` 总大小为 8B：
 
@@ -597,8 +646,6 @@ struct {
 };
 ```
 
-图示：
-
 ```text
 字节偏移      0        4        8
              ┌────────┬────────┐
@@ -608,56 +655,26 @@ LL8Packet    │ data   │ flag   │
 元数据                   4B
 ```
 
-因此：
+LL8 的有效 Payload 同样只有总字节数的 50%。
 
-```text
-Packet 总大小：8B
-有效 Payload：4B
-Flag 元数据：4B
-Payload 效率：50%
-```
+## 14.6 发送端 `putPackets()` 做了什么
 
-LL8 粒度更小，但同样有一半空间用于 Flag。
-
-## 14.5 发送端：putPackets() 做了什么
-
-接口调用可以简化为：
-
-```cpp
-putPackets(targetOffset,
-           originOffset,
-           originBytes,
-           threadId,
-           numThreads,
-           flag);
-```
-
-内部方向是：
+接口内部方向可以简化为：
 
 ```cpp
 copyToPackets(
-    dst_ + targetOffset,   // 接收端远程 Packet Buffer
-    src_ + originOffset,  // 发送端本地普通数据
+    dst_ + targetOffset,   // GPU 1 的远程 Packet Buffer
+    src_ + originOffset,  // GPU 0 的本地普通数据
     originBytes,
     threadId,
     numThreads,
     flag);
 ```
 
-发送端完整数据路径：
+发送端逐步执行：
 
-```mermaid
-flowchart LR
-    A[GPU 0 HBM<br/>发送端本地 src_] -->|Global Load| B[GPU 0 SM<br/>线程寄存器]
-    B --> C[组合 Payload + flag]
-    C -->|st.volatile.global| D[GPU 互联<br/>NVLink / NVSwitch / PCIe P2P]
-    D --> E[GPU 1 HBM<br/>接收端 Packet Buffer]
-```
-
-逐步理解：
-
-1. GPU 0 的线程从本地 `src_` 读取普通 Payload；
-2. Payload 进入 GPU 0 当前线程的寄存器；
+1. GPU 0 的线程从本地 `src_` 读取 Payload；
+2. Payload 进入 GPU 0 当前线程寄存器；
 3. 线程把 Payload 和调用者给出的 `flag` 组合成 LL16 或 LL8 Packet；
 4. GPU 0 的 SM 对远端 `dst_` 发出 Volatile Global Store；
 5. 写请求经过 NVLink、NVSwitch 或 PCIe P2P；
@@ -667,7 +684,38 @@ flowchart LR
 
 > `putPackets()` 并不是先在发送端生成一份完整 Packet 临时数组，再调用 DMA；它由参与线程逐个读取 Payload，并直接向远端 Packet 地址写入编码结果。
 
-## 14.6 LL16 发送端线程如何分工
+## 14.7 接收端 `unpackPackets()` 做了什么
+
+内部方向可以简化为：
+
+```cpp
+copyFromPackets(
+    src_ + originOffset,             // GPU 1 本地普通数据目标
+    packetBuffer_ + targetOffset,    // GPU 1 本地 Packet Buffer
+    originBytes,
+    threadId,
+    numThreads,
+    expectedFlag);
+```
+
+接收端逐步执行：
+
+1. GPU 1 的线程从本地 `packetBuffer_` 读取 Packet；
+2. 使用显式 Volatile Global Load，使轮询持续读取目标地址；
+3. 检查 Packet 中的 Flag；
+4. 如果 Flag 不是期待的本轮值，就继续读取同一个 Packet；
+5. Flag 匹配后，Payload 被取到 GPU 1 当前线程寄存器；
+6. 当前线程把 Payload 写入 GPU 1 本地普通数据区 `src_`。
+
+因此 `unpackPackets()` 同时完成：
+
+```text
+等待当前 Packet 到达
++
+把 Packet 格式转换回普通数据格式
+```
+
+## 14.8 多线程如何分工
 
 LL16 每个 Packet 承载 8B Payload：
 
@@ -678,116 +726,27 @@ for (size_t i = threadId; i < nElem; i += numThreads) {
 }
 ```
 
-假设：
+例如：
 
 ```text
 originBytes = 32B
 numThreads = 2
 ```
 
-则共有：
-
-```text
-32B / 8B = 4 个 LL16Packet
-```
-
-线程分工可能是：
+则共有 4 个 LL16Packet：
 
 ```text
 线程 0：Packet 0、Packet 2
 线程 1：Packet 1、Packet 3
 ```
 
-物理存储量为：
+物理 Packet Buffer 占用：
 
 ```text
-4 个 Packet × 16B = 64B
+4 × 16B = 64B
 ```
 
 也就是 32B Payload 需要 64B Packet Buffer。
-
-## 14.7 接收端：unpackPackets() 做了什么
-
-接收端调用可以简化为：
-
-```cpp
-unpackPackets(targetOffset,
-              originOffset,
-              originBytes,
-              threadId,
-              numThreads,
-              expectedFlag);
-```
-
-内部方向是：
-
-```cpp
-copyFromPackets(
-    src_ + originOffset,             // 接收端本地普通数据目标
-    packetBuffer_ + targetOffset,    // 接收端本地 Packet Buffer
-    originBytes,
-    threadId,
-    numThreads,
-    expectedFlag);
-```
-
-接收端完整数据路径：
-
-```mermaid
-flowchart LR
-    A[GPU 1 HBM<br/>本地 packetBuffer_] -->|ld.volatile.global| B[GPU 1 SM<br/>读取 Packet]
-    B --> C{Flag 是否等于<br/>expectedFlag?}
-    C -- 否 -->|继续轮询同一 Packet| B
-    C -- 是 --> D[提取 Payload 到线程寄存器]
-    D -->|普通 Global Store| E[GPU 1 HBM<br/>本地 src_]
-```
-
-逐步理解：
-
-1. GPU 1 的线程从本地 `packetBuffer_` 读取 Packet；
-2. 使用显式 Volatile Global Load，确保轮询时持续发出真实读取；
-3. 检查 Packet 中的 Flag；
-4. 如果 Flag 不是期待的本轮值，就继续读取同一个 Packet；
-5. Flag 匹配后，Payload 被取到当前线程寄存器；
-6. 当前线程把 Payload 写入本地普通数据区 `src_`。
-
-因此 `unpackPackets()` 同时完成两件事：
-
-```text
-等待当前 Packet 到达
-+
-把 Packet 格式转换回普通数据格式
-```
-
-## 14.8 端到端时序图
-
-下面把发送、互联、接收完整串起来：
-
-```mermaid
-sequenceDiagram
-    participant SData as GPU 0 本地 src_
-    participant SSM as GPU 0 SM
-    participant Link as NVLink / PCIe P2P
-    participant PBuf as GPU 1 packetBuffer_
-    participant RSM as GPU 1 SM
-    participant RData as GPU 1 本地 src_
-
-    RSM->>PBuf: ld.volatile.global 读取 Packet
-    PBuf-->>RSM: 旧 Flag / 未完成状态
-    RSM->>PBuf: 继续轮询
-
-    SSM->>SData: 读取 Payload
-    SData-->>SSM: Payload 进入寄存器
-    SSM->>SSM: 组合 Payload + 当前 flag
-    SSM->>Link: st.volatile.global 写远端 Packet
-    Link->>PBuf: Packet 到达 GPU 1 HBM
-
-    RSM->>PBuf: 再次读取 Packet
-    PBuf-->>RSM: Payload + 匹配的 Flag
-    RSM->>RData: 写入解包后的普通 Payload
-```
-
-这里允许接收端先开始轮询。它不需要知道远端写请求具体在哪一个周期到达，只需要等待 Flag 变成目标值。
 
 ## 14.9 Flag 如何表示“数据属于本轮”
 
@@ -805,14 +764,7 @@ sequenceDiagram
 packet.flag == 2
 ```
 
-如果 Packet Buffer 中仍是上一轮：
-
-```text
-payload = old_data
-flag = 1
-```
-
-接收端不会误把它当成第 2 轮数据。
+即使 Packet Buffer 中仍保存着第 1 轮旧 Payload，只要 Flag 不匹配，接收端就不会误用。
 
 通俗类比：
 
@@ -821,58 +773,32 @@ Payload = 包裹内容
 Flag    = 批次号
 ```
 
-收件人等待“批次 2”，即使货架上已经有“批次 1”的旧包裹，也不会拆错。
-
-工程上需要保证 Flag 的生成和复用协议一致。Flag 最终会回绕，因此不能只考虑数值递增，还要考虑缓冲复用、通信轮次和最慢参与者是否已经退出旧轮次。
+工程上还要考虑 Flag 回绕、Buffer 复用以及最慢参与者是否已经退出旧轮次。
 
 ## 14.10 LL16 为什么需要两个 Flag
 
-LL16 的写入形式是：
+接收端只有在：
 
 ```text
-[data1, flag1, data2, flag2]
+flag1 == expectedFlag
+并且
+flag2 == expectedFlag
 ```
 
-假设接收端期待 `flag = 7`。
+时才接受 `data1 + data2`。
 
-### 情况一：Packet 完整到达
+假设期待 `flag = 7`：
 
 ```text
-[data1_new, 7, data2_new, 7]
+完整到达：
+[data1_new, 7, data2_new, 7]  → 接受
+
+只更新前 8B：
+[data1_new, 7, data2_old, 6]  → 继续轮询
+
+只更新后 8B：
+[data1_old, 6, data2_new, 7]  → 继续轮询
 ```
-
-接收端看到：
-
-```text
-flag1 == 7 && flag2 == 7
-```
-
-于是接受 Payload。
-
-### 情况二：只更新了前 8B
-
-```text
-[data1_new, 7, data2_old, 6]
-```
-
-接收端看到：
-
-```text
-flag1 == 7
-flag2 != 7
-```
-
-于是继续轮询，不会组合出一半新、一半旧的 Payload。
-
-### 情况三：只更新了后 8B
-
-```text
-[data1_old, 6, data2_new, 7]
-```
-
-同样因为两个 Flag 不同时匹配而被拒绝。
-
-图示：
 
 ```mermaid
 flowchart TD
@@ -887,11 +813,11 @@ flowchart TD
 
 > 在假设每个 8B 单元具有足够原子性的前提下，帮助检测 16B Packet 的部分更新或撕裂状态。
 
-它不是说整个 16B Store 必然原子。
+它并不表示整个 16B Store 必然原子。
 
 ## 14.11 CUDA 指令层面的读写
 
-CUDA 路径中，LL16 使用类似：
+LL16 使用类似：
 
 ```text
 st.volatile.global.v4.u32
@@ -909,18 +835,11 @@ ld.volatile.global.v2.u32
 
 - 发送端确实发出目标 Global Store；
 - 接收端轮询时确实重复读取目标地址；
-- 避免编译器把轮询读取错误地复用为旧值或删除。
+- 避免编译器把轮询读取错误复用为旧值或删除。
 
 但必须注意：
 
 > Volatile Load/Store 不能被简单等同为任意场景下完整的 C++ Release/Acquire，也不能自动为 Packet 之外的所有普通内存访问建立顺序。
-
-Packet 协议首先解决的是：
-
-```text
-这个 Packet 是否属于期待轮次
-这个 Packet 的 Payload 是否完整可接受
-```
 
 如果协议还依赖其他独立内存区域，就仍需分析 Semaphore、Fence、Atomic 和内存序。
 
@@ -934,7 +853,7 @@ Packet 协议首先解决的是：
 | 接收端操作 | 直接消费普通数据 | 轮询、检查 Flag、提取 Payload |
 | Payload 效率 | 接近 100%，不考虑对齐和协议开销 | LL16/LL8 均为 50% |
 | 典型目标 | 大块数据 Goodput | 小消息低延迟、细粒度流水 |
-| 额外本地写 | 通常没有 Packet 解包写 | 解包后要写入本地 `src_` |
+| 额外本地写 | 通常没有 Packet 解包写 | 解包后写入本地 `src_` |
 | 对旧数据识别 | 依赖外部同步协议 | Flag 直接区分通信轮次 |
 
 ## 14.13 为什么 Packet 适合小消息
@@ -964,13 +883,6 @@ Packet 的代价：
 ## 14.14 一个完整例子
 
 假设 GPU 0 向 GPU 1 发送 16B 普通数据，使用 LL16Packet，当前 `flag = 5`。
-
-原始数据：
-
-```text
-Payload 0：8B
-Payload 1：8B
-```
 
 发送端编码后：
 
@@ -1069,13 +981,7 @@ DeviceSyncer.sync()
 
 第一个 Sync 保证其他线程和 Block 不会在握手完成前开始搬运；第二个 Sync 保证线程 0 通知远端或消费结果前，所有参与线程都已经完成自己的数据部分。
 
-Packet 场景中同样可能需要同步：
-
-```text
-每个线程只解包自己负责的 Packet
-```
-
-某个线程完成，并不代表所有 Packet 都完成。如果后续阶段要把整段 `src_` 当成完整数据使用，就需要合适的 Block/Grid 同步。
+Packet 场景中同样可能需要同步：某个线程完成自己负责的 Packet，并不代表全部 Packet 已经完成。如果后续阶段要把整段 `src_` 当成完整数据使用，就需要合适的 Block/Grid 同步。
 
 软件 Grid Barrier 还有一个重要工程约束：如果已驻留 Block 在 Barrier 中自旋，而尚未调度的 Block 因 SM 资源不足无法进入，可能死锁。因此必须评估：
 
@@ -1272,15 +1178,7 @@ dst[i] = reg;
 GM → UB → GM
 ```
 
-比直接：
-
-```text
-GM → GM
-```
-
-多了一跳。
-
-但 MTE 路径可以：
+比直接 `GM → GM` 多了一跳，但 MTE 路径可以：
 
 - 以 Tile 为单位提交；
 - 生成连续 Burst；
@@ -1303,7 +1201,7 @@ sequenceDiagram
     M3->>M3: 写回 Tile 0
 ```
 
-真正比较的不是“物理上经过几个存储层”，而是：
+真正比较的不是物理上经过几个存储层，而是：
 
 ```text
 每条路径能产生多大请求
@@ -1360,7 +1258,7 @@ GM
 
 ## 误区 5：发送端的 `dst_` 和接收端的 `packetBuffer_` 是两块内存
 
-错误。在 Packet Channel 配置正确时，它们可以是同一块接收端物理 Packet Buffer 的远端视图和本地视图。
+错误。在 Packet Channel 配置正确时，它们是同一块接收端物理 Packet Buffer 的远端视图和本地视图。
 
 ## 误区 6：`getPackets()` 是从远端取 Packet
 
@@ -1467,21 +1365,16 @@ Outstanding 请求增加，带宽快速上升
 → 本地 HBM
 ```
 
-Packet 发送：
+Packet 的完整端到端路径：
 
 ```text
 发送端本地 src_
 → 发送端 SM 读取 Payload
 → 组合 Payload + Flag
-→ 远端 Global Store
+→ 对 remote dst_ 发出远端 Global Store
+→ GPU 互联
 → 接收端 HBM 中的 Packet Buffer
-```
-
-Packet 接收：
-
-```text
-接收端本地 packetBuffer_
-→ Volatile Load 轮询 Flag
+→ 接收端通过 local packetBuffer_ 轮询 Flag
 → Flag 匹配后提取 Payload
 → 接收端本地 src_
 ```
@@ -1513,7 +1406,7 @@ Packet 路径最关键的地址关系是：
 
 一句话概括：
 
-> 普通 MemoryChannel 用大量 Warp 把 Load/Store 变成高并发数据流；Packet Channel 则在这条远端写入路径上加入 Flag，让接收端能够按 Packet 判断“这一小块数据是否已经属于当前轮次并且可以解包”。
+> 普通 MemoryChannel 用大量 Warp 把 Load/Store 变成高并发数据流；Packet Channel 则在同一条发送端到接收端的远端写入链路上加入 Flag，让接收端能够按 Packet 判断“这一小块数据是否已经属于当前轮次并且可以解包”。
 
 ---
 
