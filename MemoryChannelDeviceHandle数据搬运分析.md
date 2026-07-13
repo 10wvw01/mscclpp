@@ -1,11 +1,11 @@
 # MemoryChannelDeviceHandle 数据搬运分析
 
-> 面向第一次接触 GPU 通信、CUDA 内存模型和 MSCCL++ 的读者。
+> 面向第一次接触 GPU 通信、CUDA 内存模型、MSCCL++ 和昇腾 Ascend C 的读者。
 >
 > 本文尽量同时做到两点：
 >
-> 1. 保持技术描述准确，能够用于继续阅读源码和分析性能；
-> 2. 使用通俗类比解释 SM、Warp、寄存器、Global Load/Store、远端显存和同步等概念。
+> 1. 保持技术描述准确，便于继续阅读源码和分析性能；
+> 2. 使用通俗类比、流程图和对照表解释 SM、Warp、寄存器、Global Load/Store、远端显存、MTE/SDMA 和同步。
 
 ---
 
@@ -27,7 +27,7 @@
 - [14. Packet 搬运机制](#14-packet-搬运机制)
 - [15. DeviceSyncer 的作用和原理](#15-devicesyncer-的作用和原理)
 - [16. 为什么 DeviceSyncer 不能随便省略](#16-为什么-devicesyncer-不能随便省略)
-- [17. 与昇腾 NPU 的对比](#17-与昇腾-npu-的对比)
+- [17. 与昇腾 NPU 的图文对比](#17-与昇腾-npu-的图文对比)
 - [18. 常见误区](#18-常见误区)
 - [19. 性能分析建议](#19-性能分析建议)
 - [20. 最终总结](#20-最终总结)
@@ -47,25 +47,25 @@
    - `write<T>()`
    - `put()`
    - `get()`
-
 2. **带 Packet 标志的数据访问**
    - `putPackets()`
    - `unpackPacket()`
    - `unpackPackets()`
    - 已废弃的 `getPackets()`
 
-最重要的几个结论：
+最重要的结论：
 
-- `read/write` 是单个线程直接访问一个远端值；
+- `read/write` 是单个线程直接访问一个值；
 - `put/get` 是多个 GPU 线程协同搬运一整段数据；
 - `put` 是本地数据写向远端，相当于 **push**；
 - `get` 是从远端读取数据到本地，相当于 **pull**；
-- `put/get` 当前实现本质是 GPU SM 执行普通的 Global Load/Store；
-- 它不是 `cudaMemcpy`，也不是代码中显式调用的 DMA/Copy Engine；
+- 当前 `put/get` 实现本质是 GPU SM 执行 Global Load/Store；
+- 它不是代码中显式调用的 `cudaMemcpy`，也不是显式调用的 DMA/Copy Engine；
 - 数据会短暂经过当前执行线程的寄存器；
 - 寄存器永远属于当前执行 Kernel 的 GPU，不会位于远端 GPU；
-- `getPackets()` 并不是“从远端拉 Packet”，它只是已废弃的本地 Packet 解包接口别名；
-- `DeviceSyncer` 用于 Kernel 内多个 Block 的全局同步，弥补 `__syncthreads()` 只能同步一个 Block 的限制。
+- `getPackets()` 不是“从远端拉 Packet”，它只是已废弃的本地 Packet 解包接口别名；
+- `DeviceSyncer` 用于同一 Kernel 内多个 Block 的阶段同步；
+- NVIDIA GPU 和昇腾 NPU 的高吞吐请求生成器不同，因此代码不能只做语法翻译。
 
 相关源码：
 
@@ -78,7 +78,7 @@
 
 # 2. MemoryChannelDeviceHandle 是什么
 
-源码中的结构体定义如下：
+源码结构可以简化为：
 
 ```cpp
 struct MemoryChannelDeviceHandle : public BaseMemoryChannelDeviceHandle {
@@ -88,9 +88,7 @@ struct MemoryChannelDeviceHandle : public BaseMemoryChannelDeviceHandle {
 };
 ```
 
-这里的 `DeviceHandle` 表示：
-
-> 这是给 GPU Device 端代码，也就是 CUDA Kernel 使用的轻量句柄。
+这里的 `DeviceHandle` 表示它是给 GPU Device 端代码，也就是 CUDA Kernel 使用的轻量句柄。
 
 Host 侧负责：
 
@@ -99,9 +97,9 @@ Host 侧负责：
 - 创建 Semaphore；
 - 把最终可供 GPU 使用的地址封装进 DeviceHandle。
 
-Kernel 侧拿到 `MemoryChannelDeviceHandle` 后，就可以直接操作其中的地址。
+Kernel 拿到句柄后，可以直接操作其中的地址。
 
-可以把它类比成一张快递单：
+通俗类比：
 
 ```text
 MemoryChannelDeviceHandle
@@ -119,28 +117,19 @@ MemoryChannelDeviceHandle
 
 `dst_` 通常表示远端目标内存映射到当前 GPU 地址空间后的地址。
 
-注意：
+> 它在当前进程里表现为普通 Device Pointer，但背后的物理内存可能位于另一张 GPU 的 HBM。
 
-> 它在当前进程中表现为一个普通 Device Pointer，但它背后的物理内存可能位于另一张 GPU 的 HBM。
-
-因此下面的代码：
+因此：
 
 ```cpp
 *(reinterpret_cast<T*>(dst_) + index)
 ```
 
-从 C++ 语法看只是普通指针访问，但硬件实际可能通过：
-
-- NVLink；
-- NVSwitch；
-- PCIe P2P；
-- 其他支持的 GPU 互联路径；
-
-访问另一张 GPU 的显存。
+从 C++ 语法看只是普通指针访问，硬件实际可能通过 NVLink、NVSwitch 或 PCIe P2P 访问另一张 GPU 的显存。
 
 ## 3.2 `src_`
 
-`src_` 通常是当前 GPU 的本地内存地址。
+`src_` 通常是当前 GPU 的本地内存地址：
 
 - `put()` 从 `src_` 读取，再写入 `dst_`；
 - `get()` 从 `dst_` 读取，再写入 `src_`。
@@ -149,31 +138,24 @@ MemoryChannelDeviceHandle
 
 `packetBuffer_` 是本地 Packet 接收缓冲区。
 
-远端通过 `putPackets()` 把带 Flag 的 Packet 写进该缓冲区后，本地 GPU 使用：
-
-- `unpackPacket()`；
-- `unpackPackets()`；
-
-检查 Flag，并将有效 Payload 解包到本地普通数据区。
+远端通过 `putPackets()` 把带 Flag 的 Packet 写进该缓冲区后，本地 GPU 使用 `unpackPacket()` 或 `unpackPackets()` 检查 Flag，并解包有效 Payload。
 
 ---
 
 # 4. read、write、put、get、putPackets、getPackets 的区别
 
-## 4.1 总览表
-
-| 接口 | 数据方向 | 调用粒度 | 是否多线程协作 | 是否带 Packet Flag | 典型用途 |
+| 接口 | 数据方向 | 调用粒度 | 多线程协作 | Packet Flag | 典型用途 |
 |---|---|---:|---:|---:|---|
-| `read<T>` | 远端 → 当前线程寄存器 | 一个 `T` | 否 | 否 | 读取状态、少量控制字段 |
-| `write<T>` | 当前线程寄存器 → 远端 | 一个 `T` | 否 | 否 | 写状态、少量控制字段 |
-| `put` | 本地 `src_` → 远端 `dst_` | 一段连续数据 | 是 | 否 | 大块 Push 搬运 |
-| `get` | 远端 `dst_` → 本地 `src_` | 一段连续数据 | 是 | 否 | 大块 Pull 搬运 |
-| `putPackets` | 本地普通数据 → 远端 Packet Buffer | 一段 Payload | 是 | 是 | 小消息、低延迟协议 |
-| `unpackPacket` | 本地 Packet Buffer → 返回值 | 单个 Packet | 否 | 检查 Flag | 读取一个 Packet |
-| `unpackPackets` | 本地 Packet Buffer → 本地 `src_` | 多个 Packet | 是 | 检查 Flag | 批量解包 |
-| `getPackets` | 本地 Packet Buffer → 本地 `src_` | 多个 Packet | 是 | 检查 Flag | 已废弃，等价于 `unpackPackets` |
+| `read<T>` | 远端 → 当前线程寄存器 | 一个 `T` | 否 | 否 | 状态、控制字段 |
+| `write<T>` | 当前线程寄存器 → 远端 | 一个 `T` | 否 | 否 | 状态、控制字段 |
+| `put` | 本地 `src_` → 远端 `dst_` | 一段数据 | 是 | 否 | 大块 Push |
+| `get` | 远端 `dst_` → 本地 `src_` | 一段数据 | 是 | 否 | 大块 Pull |
+| `putPackets` | 本地数据 → 远端 Packet Buffer | 一段 Payload | 是 | 写入 | 小消息、低延迟协议 |
+| `unpackPacket` | 本地 Packet Buffer → 返回值 | 一个 Packet | 否 | 检查 | 读取一个 Packet |
+| `unpackPackets` | 本地 Packet Buffer → 本地 `src_` | 多个 Packet | 是 | 检查 | 批量解包 |
+| `getPackets` | 本地 Packet Buffer → 本地 `src_` | 多个 Packet | 是 | 检查 | 已废弃别名 |
 
-## 4.2 `read<T>()`
+## 4.1 `read<T>()`
 
 ```cpp
 template <typename T>
@@ -182,16 +164,9 @@ T read(uint64_t index) {
 }
 ```
 
-含义：
+当前 GPU 的一个线程发起读取，数据返回当前线程的寄存器。它适合少量数据，不适合让单个线程循环搬运大块数据。
 
-1. 当前 GPU 的一个线程发起读取；
-2. 地址是 `dst_ + index * sizeof(T)`；
-3. 数据返回当前线程的寄存器；
-4. 函数返回这个值。
-
-适合读取小量数据，不适合用一个线程循环搬运大块数据。
-
-## 4.3 `write<T>()`
+## 4.2 `write<T>()`
 
 ```cpp
 template <typename T>
@@ -200,76 +175,28 @@ void write(uint64_t index, const T& v) {
 }
 ```
 
-含义：
-
-1. 当前线程持有值 `v`；
-2. 当前 GPU 向 `dst_` 对应地址发出 Store；
-3. 如果 `dst_` 是远端映射地址，数据会经过 GPU 互联写入远端 HBM。
-
 它是普通内存写，不自动等价于原子操作，也不天然提供完整的跨线程同步语义。
 
-## 4.4 `put()`
-
-```cpp
-copy(dst_ + targetOffset,
-     src_ + originOffset,
-     originBytes,
-     threadId,
-     numThreads);
-```
-
-含义：
+## 4.3 `put()` 与 `get()`
 
 ```text
-本地 GPU 内存 → 当前 GPU SM → 远端 GPU 内存
+put：本地 src_ → 远端 dst_
+get：远端 dst_ → 本地 src_
 ```
 
-多个线程共同处理不同元素。
+它们调用同一个 `copy()`，只是源和目的方向相反。
 
-## 4.5 `get()`
+## 4.4 `getPackets()`
 
-```cpp
-copy(src_ + targetOffset,
-     dst_ + originOffset,
-     originBytes,
-     threadId,
-     numThreads);
-```
+源码中它直接调用 `unpackPackets()`，所以：
 
-含义：
-
-```text
-远端 GPU 内存 → 当前 GPU SM → 本地 GPU 内存
-```
-
-## 4.6 `putPackets()`
-
-`putPackets()` 不只是复制 Payload，它还为每个 Payload 附加 Flag。
-
-接收方只有在观察到预期 Flag 后，才认为 Packet 有效。
-
-## 4.7 `getPackets()`
-
-源码中：
-
-```cpp
-[[deprecated("Use unpackPackets() instead.")]]
-void getPackets(...) {
-  unpackPackets(...);
-}
-```
-
-因此必须强调：
-
-> `getPackets()` 不是远端版 `get()`，而是旧命名留下的本地 Packet 解包接口。
+> `getPackets()` 不是远端版 `get()`，而是历史命名留下的本地 Packet 解包接口。
 
 ---
 
 # 5. put 和 get 的底层 copy 原理
 
-核心实现在：
-
-[`include/mscclpp/copy_device.hpp`](include/mscclpp/copy_device.hpp)
+核心代码：
 
 ```cpp
 template <typename T>
@@ -288,67 +215,19 @@ void copy(T* dst, T* src,
 可以把它理解成一群搬运工共同搬仓库：
 
 ```text
-线程 0：搬第 0、N、2N... 个元素
-线程 1：搬第 1、N+1、2N+1... 个元素
-线程 2：搬第 2、N+2、2N+2... 个元素
+线程 0：搬 0、N、2N、3N ...
+线程 1：搬 1、N+1、2N+1 ...
+线程 2：搬 2、N+2、2N+2 ...
 ...
 ```
 
-其中 `N = numThreads`。
-
-每个线程重复执行：
+每个线程执行：
 
 ```text
-从 src 读取一个元素
-        ↓
-放进自己的寄存器
-        ↓
-写入 dst
+Global Load → 本线程寄存器 → Global Store
 ```
 
-## 5.1 对齐策略
-
-外层 `copy()` 根据模板参数选择搬运宽度：
-
-```cpp
-Alignment == 4  → int
-Alignment == 8  → long long
-Alignment == 16 → longlong2
-```
-
-其中：
-
-```text
-int        = 4 字节
-long long  = 8 字节
-longlong2  = 16 字节
-```
-
-默认使用 16 字节对齐和 `longlong2` 搬运主体数据。
-
-如果头部或尾部不能满足 16 字节对齐，`copyHelper()` 会用 4 字节整数处理剩余部分。
-
-## 5.2 这不是直接的内存到内存指令
-
-下面的 C++：
-
-```cpp
-reg = src[i];
-dst[i] = reg;
-```
-
-概念上通常对应：
-
-```text
-Global Load  src[i] → register
-Global Store register → dst[i]
-```
-
-不是：
-
-```text
-一条神奇指令直接把 src HBM 搬到 dst HBM
-```
+`Alignment=16` 时使用 `longlong2`，每个线程每次处理 16 字节；头尾不满足 16 字节主体对齐时，辅助逻辑会使用更小粒度处理。
 
 ---
 
@@ -356,244 +235,134 @@ Global Store register → dst[i]
 
 ## 6.1 SM
 
-SM 全称 Streaming Multiprocessor，可以理解为 GPU 内部的“并行计算车间”。
+SM（Streaming Multiprocessor）是 NVIDIA GPU 执行 Kernel 的主要计算单元，内部包含：
 
-一个 SM 内通常包含：
+- Warp Scheduler；
+- CUDA Core / ALU；
+- Load/Store Unit；
+- Register File；
+- Shared Memory / L1；
+- 其他专用执行单元。
 
-```text
-SM
-├── Warp Scheduler
-├── 整数/浮点计算单元
-├── Tensor Core
-├── Load/Store Unit
-├── Register File
-├── Shared Memory
-└── L1 Cache
-```
+## 6.2 Warp
 
-一张 GPU 上通常有很多 SM。
-
-## 6.2 CUDA Thread
-
-CUDA 程序逻辑上由大量线程组成：
-
-```cpp
-int tid = blockIdx.x * blockDim.x + threadIdx.x;
-```
-
-每个线程拥有自己的：
-
-- 线程编号；
-- 逻辑寄存器；
-- 程序计数和状态；
-- 局部变量；
-- 访问地址。
-
-## 6.3 Warp
-
-NVIDIA GPU 不会以单个线程为基本调度单位，而是把相邻的 32 个线程组成一个 Warp：
+Warp 是 NVIDIA GPU 的基本线程调度和执行组，通常由连续的 32 个 CUDA 线程组成：
 
 ```text
-Warp 0：thread 0  ~ 31
-Warp 1：thread 32 ~ 63
-Warp 2：thread 64 ~ 95
+Warp 0：thread 0  ～ thread 31
+Warp 1：thread 32 ～ thread 63
+...
 ```
 
 一个 Warp 中的每个线程也称为一个 Lane。
 
-```text
-Warp
-├── lane 0
-├── lane 1
-├── ...
-└── lane 31
-```
+## 6.3 SIMT
 
-硬件通常向一个 Warp 发射同一条指令，各 Lane 使用自己的寄存器和地址执行。
-
-这种模式称为 SIMT：
-
-> Single Instruction, Multiple Threads，单指令、多线程。
+CUDA 对程序员表现为多个独立线程，但硬件把 32 个线程组合成 Warp 执行同一条或同一路径上的指令。这称为 SIMT：Single Instruction, Multiple Threads。
 
 ---
 
 # 7. 为什么一个 Warp 是 32 个线程
 
-32 不是数学定理，而是 NVIDIA 长期采用的架构设计选择。
+32 不是数学定理，而是 NVIDIA 的架构选择，是以下因素的工程折中：
 
-这是多个因素的折中：
-
-- 指令调度和解码开销；
-- 执行单元利用率；
+- 指令获取和调度开销；
+- 执行吞吐；
 - 内存访问合并；
-- 分支发散成本；
-- 寄存器资源占用；
-- Warp 调度灵活性。
+- 分支发散代价；
+- 寄存器和其他资源占用；
+- 延迟隐藏能力。
 
-如果 Warp 太小：
+Warp 太小，调度开销相对变大；Warp 太大，分支发散和资源占用会更严重。NVIDIA 长期选择 32 Lane 作为平衡点。
 
-- 每条指令服务的线程太少；
-- 调度管理开销相对较大；
-- 很难集中形成较大的连续内存访问。
-
-如果 Warp 太大：
-
-- 分支发散时浪费更严重；
-- 资源占用更集中；
-- 调度灵活性下降。
-
-32 是 NVIDIA 选择的工程平衡点。
-
-## 7.1 Warp 对拷贝的意义
-
-假设每个线程搬 16 字节：
-
-```cpp
-longlong2 reg = src[i];
-```
-
-一个 Warp 的逻辑数据量是：
+如果 Block 有 256 个线程，则逻辑上包含：
 
 ```text
-32 × 16 B = 512 B
+256 / 32 = 8 个 Warp
 ```
 
-如果 32 个线程访问连续地址，硬件可将这些请求合并成较少的内存 Transaction，而不是完全独立地执行 32 次随机小访问。
-
-这叫做 Coalesced Memory Access，合并内存访问。
+Block 大小不是 32 的倍数时，最后一个 Warp 会有部分 Lane 不工作。
 
 ---
 
 # 8. 什么是 GPU 寄存器
 
-## 8.1 逻辑上属于单个线程
-
-```cpp
-longlong2 reg;
-```
-
-这里的 `reg` 从 CUDA 编程模型看，是当前线程私有变量。
+从编程模型看，每个 CUDA 线程拥有自己的逻辑寄存器；从物理位置看，寄存器资源位于当前 GPU 的 SM Register File。
 
 ```text
-线程 0 有自己的 reg
-线程 1 有自己的 reg
-...
-线程 31 有自己的 reg
-```
-
-## 8.2 物理上位于当前 SM 的 Register File
-
-寄存器由当前执行 Kernel 的 GPU SM 提供。
-
-```text
-GPU 0
+当前 GPU
 └── SM
     └── Register File
-        ├── Thread 0 的寄存器
-        ├── Thread 1 的寄存器
+        ├── Thread 0 的逻辑寄存器
+        ├── Thread 1 的逻辑寄存器
         └── ...
 ```
 
-最重要的结论：
+关键结论：
 
-> 如果 Kernel 在 GPU 0 上执行，那么 `reg` 位于 GPU 0 的 SM 中；即使读取的是 GPU 1 的 HBM，返回值也会进入 GPU 0 的寄存器。
+> Kernel 在 GPU 0 上执行，`reg` 就属于 GPU 0 的 SM；即使 `src` 或 `dst` 指向 GPU 1，寄存器也不会跑到 GPU 1。
 
-不存在：
-
-```text
-GPU 0 的线程，把自己的寄存器分配到 GPU 1
-```
-
-## 8.3 寄存器和 HBM 不同
-
-可以按距离粗略理解：
-
-```text
-计算单元
-  ↓
-寄存器
-  ↓
-Shared Memory / L1
-  ↓
-L2
-  ↓
-本地 HBM
-  ↓
-NVLink / PCIe
-  ↓
-远端 GPU HBM
-```
-
-## 8.4 Register Spill
-
-如果线程使用过多寄存器，编译器可能发生 Register Spill。
-
-被 Spill 的变量会放到 CUDA 所称的 Local Memory。
-
-注意：
-
-> CUDA Local Memory 只是逻辑上线程私有，物理上通常仍位于当前 GPU 的显存系统中，并不等价于 SM 内部高速寄存器。
+如果寄存器压力过高，编译器可能发生 Register Spill。CUDA 的 `local memory` 虽然逻辑上线程私有，但物理上通常由当前 GPU 的显存和缓存层次承载，并不是 SM 内的寄存器。
 
 ---
 
 # 9. 什么是 Global Load 和 Global Store
 
-Global 表示 CUDA 的 Global Address Space，不简单等同于“当前 GPU 的 HBM”。
+```cpp
+reg = src[i];
+dst[i] = reg;
+```
 
-同一条 Global Load，地址可能映射到：
+概念上可能对应：
+
+```text
+ld.global  从 Global 地址空间读取
+st.global  向 Global 地址空间写入
+```
+
+`Global` 是地址空间概念，不等于“必定访问本地 HBM”。地址可能映射到：
 
 - 当前 GPU HBM；
-- 另一张 GPU 的 Peer Memory；
-- 映射的 Host Pinned Memory；
-- 其他通过 CUDA 地址映射机制可访问的内存。
+- 另一张 GPU 的 Peer HBM；
+- 映射后的 Host Memory。
 
-例如：
-
-```cpp
-T value = ptr[index];
-```
-
-可能生成概念上的：
-
-```text
-ld.global
-```
-
-而：
-
-```cpp
-ptr[index] = value;
-```
-
-可能生成概念上的：
-
-```text
-st.global
-```
-
-最终物理访问位置由：
-
-- GPU 页表；
-- UVA/VMM；
-- CUDA IPC 映射；
-- Peer Access；
-- 实际硬件拓扑；
-
-共同决定。
-
-因此：
-
-> 不能只看到 `ld.global` 就断言它一定访问本地 HBM。
+所以判断物理位置不能只看 `ld.global/st.global`，还要看指针的映射来源。
 
 ---
 
 # 10. put 的真实数据路径
 
-假设：
+假设 Kernel 在 GPU 0 上执行，`src_` 是 GPU 0 本地内存，`dst_` 是 GPU 1 的远端映射内存：
 
-- Kernel 在 GPU 0 上执行；
-- `src_` 位于 GPU 0 HBM；
-- `dst_` 映射到 GPU 1 HBM。
+```mermaid
+flowchart LR
+    A[GPU 0 HBM\n本地 src_] -->|Global Load| B[GPU 0 SM\n线程寄存器]
+    B -->|Global Store| C[GPU 0 互联接口]
+    C -->|NVLink / NVSwitch / PCIe P2P| D[GPU 1 HBM\n远端 dst_]
+```
+
+对应一句话：
+
+> GPU 0 的 SM 先把本地数据加载到 GPU 0 的线程寄存器，再从该寄存器向 GPU 1 的映射地址发出 Store。
+
+---
+
+# 11. get 的真实数据路径
+
+仍假设 Kernel 在 GPU 0 上执行：
+
+```mermaid
+flowchart LR
+    A[GPU 1 HBM\n远端 dst_] -->|远端 Global Load| B[NVLink / NVSwitch / PCIe P2P]
+    B --> C[GPU 0 SM\n线程寄存器]
+    C -->|本地 Global Store| D[GPU 0 HBM\n本地 src_]
+```
+
+`get` 的远端读取包含请求和返回，对远端访问延迟及 Outstanding Read 数量通常更加敏感。
+
+---
+
+# 12. longlong2 搬运为什么可能很快
 
 代码：
 
@@ -603,97 +372,300 @@ reg = src[i];
 dst[i] = reg;
 ```
 
-完整路径可以理解为：
+`longlong2` 是 16 字节。单个线程每次只处理 16B，但 GPU 不能只看单线程：
 
 ```text
-第一阶段：本地读取
-
-GPU 0 HBM
-    ↓ Global Load
-GPU 0 内存层次
-    ↓
-GPU 0 SM 的线程寄存器 reg
-
-第二阶段：远端写入
-
-GPU 0 SM 寄存器 reg
-    ↓ Global Store
-GPU 0 互连接口
-    ↓
-NVLink / NVSwitch / PCIe P2P
-    ↓
-GPU 1 内存系统
-    ↓
-GPU 1 HBM
+1 个线程：16B
+1 个 Warp：32 × 16B = 512B 逻辑数据
+多个 Warp：持续产生请求
+多个 SM：进一步并发
 ```
 
-简写为：
+同一 Warp 的线程访问连续地址时，硬件可以把它们组织为较少的内存 Transaction，而不是把 32 个线程完全当作互不相关的小请求。
 
-```text
-GPU 0 HBM → GPU 0 SM Register → GPU 1 HBM
-```
+真正使它变快的是：
 
-这是一种由 GPU 0 SM 主动发起的 Push。
+- 连续地址；
+- 合适对齐；
+- Warp 级合并访存；
+- 足够多的活跃 Warp；
+- 足够多的 Outstanding 请求；
+- 多个 SM 并行；
+- 本地 HBM、远端 HBM 和互联带宽能够被填满。
+
+> 不是因为 `longlong2` 这个类型本身“自带高带宽”。
 
 ---
 
-# 11. get 的真实数据路径
+# 13. 这种写法是不是最快
 
-假设仍由 GPU 0 执行 Kernel：
+不一定。
 
-```cpp
-reg = remoteSrc[i];
-localDst[i] = reg;
-```
+## 13.1 纯大块复制
 
-路径为：
+对于纯粹的大块连续数据复制，应当对比：
 
-```text
-GPU 1 HBM
-    ↓ Remote Global Load
-NVLink / NVSwitch / PCIe P2P
-    ↓
-GPU 0 SM 的线程寄存器 reg
-    ↓ Local Global Store
-GPU 0 HBM
-```
+- `put/get` 的 SM Copy；
+- `cudaMemcpyPeerAsync()`；
+- 通信库或硬件专用复制路径。
 
-简写为：
+专用复制路径可能减少 SM 占用，并与计算并发。
 
-```text
-GPU 1 HBM → GPU 0 SM Register → GPU 0 HBM
-```
+## 13.2 SM Copy 的价值
 
-这是一种由 GPU 0 SM 主动发起的 Pull。
+SM Copy 的优势常常不是单独 memcpy 峰值，而是：
 
-## 11.1 put 和 get 的潜在性能差异
+- Kernel 内自主通信；
+- Persistent Kernel；
+- 低延迟小消息；
+- 不规则 Scatter/Gather；
+- 边通信边计算；
+- Packet 协议；
+- 避免返回 Host 再启动复制。
 
-`put` 的远端方向是 Store：
-
-```text
-本地读 → 远端写
-```
-
-`get` 的远端方向是 Load：
-
-```text
-远端读请求 → 远端 HBM → 数据返回
-```
-
-远端 Load 通常更依赖：
-
-- 请求往返延迟；
-- Outstanding Read 数量；
-- Warp 并发度；
-- 互联拓扑。
-
-但不能简单断言所有设备上 `put` 一定比 `get` 快，最终需要基准测试。
+因此应比较端到端目标，而不是只比较一段 memcpy 的孤立带宽。
 
 ---
 
-# 12. longlong2 搬运为什么可能很快
+# 14. Packet 搬运机制
 
-单看一个线程：
+## 14.1 LL16Packet
+
+LL16Packet 总大小 16B，但有效 Payload 是 8B：
+
+```text
+[data1][flag1][data2][flag2]
+```
+
+接收方只有在 `flag1` 和 `flag2` 都等于预期轮次 Flag 时，才接受 Payload。重复 Flag 用于帮助识别部分更新或撕裂状态。
+
+## 14.2 LL8Packet
+
+LL8Packet 总大小 8B，有效 Payload 是 4B：
+
+```text
+[data][flag]
+```
+
+## 14.3 访问方式
+
+CUDA 实现使用显式的 Volatile Global Load/Store，并轮询 Flag：
+
+```text
+st.volatile.global
+ld.volatile.global
+```
+
+Packet 协议适合小消息和低延迟到达检测，但 Flag 会占用额外带宽，因此不适合追求大块纯 Payload 的最高 Goodput。
+
+---
+
+# 15. DeviceSyncer 的作用和原理
+
+`DeviceSyncer` 是同一个 Kernel 内的 Device-wide Barrier，用于多个 Block 的阶段同步。
+
+`__syncthreads()` 只能同步同一个 Block，不能同步不同 Block。
+
+实现步骤：
+
+1. Block 内执行 `__syncthreads()`；
+2. 每个 Block 的 `threadIdx.x == 0` 作为代表；
+3. 代表线程对全局计数器执行 Atomic Fetch Add；
+4. 代表线程轮询直到计数等于参与 Block 数；
+5. 使用 Acquire/Release 建立跨 Block 可见性；
+6. 再执行一次 Block 内 `__syncthreads()`，放行本 Block 其他线程。
+
+```mermaid
+flowchart TD
+    A[每个 Block 内 __syncthreads] --> B[每个 Block 的线程 0 atomicAdd]
+    B --> C{counter == blockNum?}
+    C -- 否 --> C
+    C -- 是 --> D[每个 Block 内第二次 __syncthreads]
+    D --> E[所有线程进入下一阶段]
+```
+
+源码使用三个计数器轮转，避免不同 Barrier 代际互相污染，并支持同步 Block 数变化的场景。
+
+---
+
+# 16. 为什么 DeviceSyncer 不能随便省略
+
+典型流程：
+
+```text
+线程 0 与远端完成握手
+        ↓
+DeviceSyncer.sync()
+        ↓
+所有线程共同 put/get
+        ↓
+DeviceSyncer.sync()
+        ↓
+线程 0 Signal 通知远端完成
+```
+
+第一个 Sync 保证其他线程和 Block 不会在握手完成前开始搬运；第二个 Sync 保证线程 0 发 Signal 前，所有参与线程都已经完成自己的数据部分。
+
+软件 Grid Barrier 还存在工程约束：如果已驻留 Block 在 Barrier 中自旋，而尚未调度的 Block 因 SM 资源不足无法进入，可能死锁。因此必须评估 Grid 大小、Block 大小、寄存器、Shared Memory 和实际可同时驻留 Block 数量。
+
+---
+
+# 17. 与昇腾 NPU 的图文对比
+
+这一节重点回答两个问题：
+
+1. 为什么 NVIDIA GPU 上 `reg = src[i]; dst[i] = reg;` 可能很快？
+2. 为什么不能把这种编程方式逐行照搬到昇腾 NPU？
+
+先给出最核心的答案：
+
+> 两种芯片负责“制造高并发大吞吐内存请求”的硬件主体不同。
+>
+> NVIDIA GPU 主要依靠 SM 中的大量 Warp；昇腾 AI Core 的典型高吞吐数据通路主要依靠 MTE/SDMA 和显式流水。
+
+## 17.1 两种架构的“主力搬运工”不同
+
+### NVIDIA GPU：大量 Warp 是主力搬运工
+
+```mermaid
+flowchart LR
+    A[大量 CUDA Thread] --> B[每 32 个组成 Warp]
+    B --> C[连续地址合并访存]
+    C --> D[多个 Outstanding Load/Store]
+    D --> E[本地 HBM / NVLink / PCIe P2P]
+    F[Warp 0 等内存] --> G[调度 Warp 1/2/3]
+    G --> D
+```
+
+GPU 的线程系统本身就被设计成大规模内存并发请求生成器：
+
+```text
+32 Lane / Warp
+× 多个 Active Warp / SM
+× 多个 SM
+= 大量并发内存请求
+```
+
+### 昇腾 NPU：MTE/SDMA 是主力搬运工
+
+```mermaid
+flowchart LR
+    A[GM / 远端 GM] -->|MTE2 批量搬运| B[UB / L1]
+    B -->|Vector / Cube| C[UB / L1 中的计算结果]
+    C -->|MTE3 批量搬运| D[GM / 远端 GM]
+    E[Scalar PIPE_S] -->|地址、循环、事件和控制| A
+    F[SDMA / 通信引擎] -->|大块复制或通信| D
+```
+
+典型 Ascend C AI Core 流水可粗略理解为：
+
+| 流水/单元 | 主要职责 |
+|---|---|
+| `PIPE_S` | 标量控制、地址计算、少量标量访问 |
+| `PIPE_V` | UB 上的向量计算 |
+| `PIPE_M` | 矩阵/Cube 计算 |
+| `PIPE_MTE2` | GM → UB/L1 批量搬运 |
+| `PIPE_MTE3` | UB → GM 批量搬运 |
+| SDMA/通信引擎 | 特定大块复制和通信路径 |
+
+这里不是说昇腾完全不能访问 GM，而是说：
+
+> 对大块连续数据而言，高吞吐路径通常不是让标量流水逐元素读写，而是给 MTE/SDMA 一个批量搬运描述。
+
+## 17.2 一段相似代码，为什么落到不同硬件路径
+
+从 C++ 表面看，两边都可能写成“读一个值，再写一个值”，但编译后的执行组织不同：
+
+```mermaid
+flowchart TB
+    S[表面语义：读取 16B，再写出 16B]
+
+    S --> G1[CUDA 路径]
+    G1 --> G2[每线程一个 16B 操作]
+    G2 --> G3[32 线程组成 Warp]
+    G3 --> G4[连续地址请求被合并]
+    G4 --> G5[大量 Warp 隐藏延迟并堆高并发]
+
+    S --> N1[若在昇腾上逐元素 GetValue/SetValue]
+    N1 --> N2[标量流水发起小粒度访问]
+    N2 --> N3[不会自动出现 CUDA 的 32 Lane Warp]
+    N3 --> N4[请求粒度和 Outstanding 并发不足]
+    N4 --> N5[难以填满 GM/HBM/HCCS 带宽]
+
+    S --> N6[昇腾高吞吐写法]
+    N6 --> N7[按 Tile 描述一批数据]
+    N7 --> N8[MTE/SDMA 生成 Burst 和并发请求]
+```
+
+因此：
+
+```text
+相同的高级语言语义
+≠ 相同的硬件执行组织
+≠ 相同的性能
+```
+
+## 17.3 通俗类比：搬箱子
+
+### GPU 模型
+
+可以把一个 Warp 想象成 32 个搬运工：
+
+```text
+32 个搬运工同时出发
+每人拿一个 16B 小箱子
+地址连续时，仓库系统把它们组织成成批装卸
+某一组在等车，调度员马上安排另一组继续干活
+```
+
+虽然每个人每次拿得不多，但搬运工数量多、出发并发高，最终可以形成很大的数据流。
+
+### 昇腾标量照搬模型
+
+如果使用逐元素标量 GM 访问，可以类比成：
+
+```text
+让负责登记、调度和控制的管理员
+亲自一箱一箱往返仓库搬货
+```
+
+管理员可以搬，但这不是系统为大宗货物设计的主通路。
+
+### 昇腾 MTE/SDMA 模型
+
+MTE/SDMA 更像叉车和货运流水线：
+
+```text
+告诉叉车：
+源地址、目的地址、总长度、块数、每块长度、Stride
+
+然后叉车批量搬运，管理员只负责提交任务和处理事件
+```
+
+根因不是“昇腾寄存器慢”，而是：
+
+> 把 GPU 的主力搬运通路，错误映射成了 NPU 的控制/标量通路。
+
+## 17.4 最核心根因：高带宽请求生成器不同
+
+| 维度 | NVIDIA GPU | 昇腾 NPU 典型 AI Core 模型 |
+|---|---|---|
+| 高带宽请求生成器 | SM 中大量 Warp/Lane | MTE/SDMA 描述符和搬运流水 |
+| 基本并发来源 | 多线程、多 Warp、多 SM | Tile、Burst、搬运队列、多流水重叠 |
+| 连续访问聚合 | Warp Coalescing | MTE Block/BlockLen/Stride 描述 |
+| 隐藏延迟 | Warp 切换 | MTE2/Vector/MTE3 流水重叠、双缓冲 |
+| 计算的主要数据位置 | 可直接大量访问 Global Memory | Vector/Cube 通常围绕 UB/L1 数据工作 |
+| 单个大类型的含义 | 每 Lane 16B，再乘 32 Lane | 16B 类型本身不会自动创造 32 Lane 并发 |
+| 大块纯复制 | SM Copy 或 Copy Engine | MTE、SDMA 或通信库路径 |
+| 同步方式 | Warp/Block/Grid + 内存序 | Queue/Event/SetFlag/WaitFlag/流水 Barrier |
+
+一句话归纳：
+
+> GPU 用“很多线程一起发请求”制造吞吐；昇腾用“专用搬运流水批量发请求”制造吞吐。
+
+## 17.5 为什么 `longlong2` 不能机械翻译
+
+CUDA 代码：
 
 ```cpp
 longlong2 reg;
@@ -701,513 +673,249 @@ reg = src[i];
 dst[i] = reg;
 ```
 
-它一次只搬 16 字节，好像很慢。
-
-但 GPU 实际依赖的是大规模并行：
+它在 GPU 上快的完整条件是：
 
 ```text
-每个线程一次 16B
-× 一个 Warp 32 个线程
-× 每个 SM 多个活跃 Warp
-× 一张 GPU 多个 SM
-```
-
-一个 Warp 每轮逻辑上可以处理：
-
-```text
-32 × 16B = 512B
-```
-
-多个 Warp 又可以同时存在大量尚未完成的 Load/Store 请求。
-
-GPU 隐藏内存延迟的方法不是让单次访问变得没有延迟，而是：
-
-```text
-Warp 0 发出 Load 后等待
-    ↓
-SM 去执行 Warp 1
-    ↓
-再执行 Warp 2
-    ↓
-Warp 0 数据返回后继续执行
-```
-
-因此高性能来自以下组合：
-
-- 连续地址；
-- 16 字节对齐；
-- Warp 合并访问；
-- 足够多的线程；
-- 足够多的活跃 Warp；
-- 足够多的 Outstanding 请求；
-- 合适的 NVLink/PCIe 拓扑。
-
-不是因为“寄存器中转本身特别快”这么简单。
-
----
-
-# 13. 这种写法是不是最快
-
-结论：
-
-> 不一定，必须区分纯拷贝和通信计算融合场景。
-
-## 13.1 纯大块连续拷贝
-
-应与以下方案比较：
-
-- `cudaMemcpyPeerAsync`；
-- CUDA Driver/Runtime 提供的异步 P2P Copy；
-- NCCL/MSCCL++ 中其他专用 Transport；
-- 硬件支持的 Copy Engine 或 DMA 路径。
-
-专用复制路径的潜在优势：
-
-- 不占用大量 SM；
-- 可与计算并发；
-- Driver 可选择适合的硬件复制通路；
-- 对纯连续大块复制通常优化充分。
-
-## 13.2 SM Copy 的优势
-
-SM Load/Store 的价值在于它可以直接嵌入 Kernel：
-
-- Persistent Kernel；
-- 通信和计算融合；
-- 边读边 Reduce；
-- Scatter/Gather；
-- 小消息低延迟；
-- Packet 协议；
-- 不规则访问；
-- 不退出 Kernel 即可发起通信。
-
-例如：
-
-```cpp
-longlong2 remote = remoteSrc[i];
-longlong2 local = localSrc[i];
-
-remote.x += local.x;
-remote.y += local.y;
-
-remoteDst[i] = remote;
-```
-
-这时若先独立 Copy，再启动计算 Kernel，可能需要额外同步、中间 Buffer 和 Launch 开销。
-
-因此 SM Copy 经常优化的是：
-
-> 端到端通信计算流程，而不只是单独 memcpy 的峰值带宽。
-
-## 13.3 影响 `longlong2` 性能的条件
-
-必须关注：
-
-- `src` 和 `dst` 是否 16B 对齐；
-- Warp 内线程是否访问连续地址；
-- Block 和 Grid 是否足够大；
-- 寄存器占用是否导致低 Occupancy；
-- 是否发生 Register Spill；
-- 是否存在过多同步；
-- 访问方向是本地、NVLink Peer 还是 PCIe Peer；
-- 是否受到 L2、HBM、Load/Store Pipeline 或互联带宽限制。
-
----
-
-# 14. Packet 搬运机制
-
-Packet 机制用于解决：
-
-> 接收方如何判断一小段远端数据已经完整到达并属于当前这一轮通信？
-
-## 14.1 LL16Packet
-
-源码定义：
-
-```cpp
-struct {
-  uint32_t data1;
-  uint32_t flag1;
-  uint32_t data2;
-  uint32_t flag2;
-};
-```
-
-总大小 16 字节，其中：
-
-```text
-有效 Payload：8 字节
-Flag 元数据：8 字节
-```
-
-有效载荷率约为 50%。
-
-发送方概念上写入：
-
-```text
-[data1, flag, data2, flag]
-```
-
-接收方反复读取，只有：
-
-```text
-flag1 == expectedFlag
-并且
-flag2 == expectedFlag
-```
-
-才认为 8 字节 Payload 有效。
-
-两个 Flag 的作用是帮助检测部分更新或撕裂状态。
-
-## 14.2 LL8Packet
-
-结构为：
-
-```cpp
-struct {
-  uint32_t data;
-  uint32_t flag;
-};
-```
-
-总大小 8 字节，有效 Payload 4 字节。
-
-## 14.3 CUDA 实现
-
-Packet 使用显式 PTX 风格的 Volatile Global Load/Store：
-
-```text
-st.volatile.global
-ld.volatile.global
-```
-
-接收方通过轮询 Flag 判断 Packet 是否就绪。
-
-注意：
-
-> Packet Flag 协议用于检测某个 Packet 是否属于目标轮次，但不能简单等价为任意场景下完整的 C++ Release/Acquire 同步。
-
-必须结合实际调用协议和同步规则理解。
-
-## 14.4 为什么 Packet 适合小消息
-
-普通路径可能需要：
-
-```text
-写数据
-→ Fence/Signal
-→ 接收方 Wait
-→ 再读数据
-```
-
-Packet 把“数据”和“轮次 Flag”放在同一个小单元中：
-
-```text
-Payload + Flag
-```
-
-接收方可以直接轮询 Packet，因此适合：
-
-- 小消息；
-- 低延迟；
-- 细粒度生产消费；
-- 不希望为每个小片段单独维护 Semaphore 的场景。
-
-代价是：
-
-- Flag 占用额外带宽；
-- 有效载荷率低；
-- 接收方需要轮询；
-- 不适合追求大块纯数据的最高 Goodput。
-
----
-
-# 15. DeviceSyncer 的作用和原理
-
-`DeviceSyncer` 定义在：
-
-[`include/mscclpp/concurrency_device.hpp`](include/mscclpp/concurrency_device.hpp)
-
-它是一种 Device-wide Barrier，用于同一个 Kernel 内多个 Block 的同步。
-
-## 15.1 为什么 `__syncthreads()` 不够
-
-`__syncthreads()` 只能同步同一个 Block 内的线程。
-
-```text
-Block 0 内线程：可以互相同步
-Block 1 内线程：可以互相同步
-Block 0 和 Block 1：不能只靠 __syncthreads() 同步
-```
-
-但 `put/get` 经常由多个 Block 共同参与：
-
-```text
-Block 0 搬一部分
-Block 1 搬一部分
-Block 2 搬一部分
-...
-```
-
-如果需要确认所有 Block 都到达某个阶段，就需要 Grid 级同步能力。
-
-## 15.2 实现步骤
-
-`sync(blockNum)` 大致分为：
-
-1. Block 内 `__syncthreads()`；
-2. 每个 Block 的 `threadIdx.x == 0` 作为代表；
-3. 代表线程对全局计数器执行 Atomic Fetch Add；
-4. 每个代表线程轮询，直到计数等于 `blockNum`；
-5. 使用 Acquire/Release 保证跨 Block 可见性；
-6. 再执行一次 Block 内 `__syncthreads()`，放行本 Block 其他线程。
-
-概念图：
-
-```text
-Block 0 leader ─┐
-Block 1 leader ─┼─ atomicAdd(counter)
-Block 2 leader ─┘
-
-所有 leader 等待 counter == blockNum
-
-达到目标后：
-每个 leader 通过 __syncthreads() 放行本 Block
-```
-
-## 15.3 为什么使用三个计数器
-
-源码中：
-
-```cpp
-static const unsigned int NumCounters = 3U;
-```
-
-每次 Barrier 轮换使用计数器，并提前清理后续计数器。
-
-这样做主要用于避免不同轮次 Barrier 之间互相污染，例如：
-
-```text
-某些 Block 已进入下一轮
-另一些 Block 还停留在上一轮
-```
-
-如果只使用一个计数器并简单清零，快速 Block 可能提前清理一个仍被慢速 Block 观察的计数器。
-
-三个计数器轮转可以更安全地隔离相邻 Barrier 代际，并支持同步 Block 数量变化的场景。
-
----
-
-# 16. 为什么 DeviceSyncer 不能随便省略
-
-典型流程可能是：
-
-```text
-线程 0 与远端完成握手
-        ↓
-DeviceSyncer.sync()
-        ↓
-所有线程共同执行 put/get
-        ↓
-DeviceSyncer.sync()
-        ↓
-线程 0 发 Signal 通知远端完成
-```
-
-## 16.1 第一个 Sync
-
-如果只有一个线程负责 Wait：
-
-```text
-thread 0 已确认远端准备好
-其他 Block 的线程可能还不知道或还没到达
-```
-
-第一个 Sync 保证所有参与搬运的线程都在握手完成后再开始。
-
-## 16.2 第二个 Sync
-
-多个线程共同搬运时：
-
-```text
-thread 0 先搬完自己的部分
-不代表其他线程和 Block 已搬完
-```
-
-如果 thread 0 立即 Signal，远端可能开始读取尚未完全写好的数据。
-
-第二个 Sync 用于保证所有参与线程都完成自己的数据部分后，再由代表线程通知远端。
-
-## 16.3 使用限制
-
-软件实现的 Grid Barrier 有一个重要工程约束：
-
-> 所有参与 Barrier 的 Block 必须有机会同时驻留或至少能够共同推进。
-
-如果已驻留的 Block 在 Barrier 中自旋，而尚未调度的 Block 因资源不足无法进入 SM，可能发生死锁。
-
-因此使用时需要确认：
-
-- Grid 大小；
-- 每个 Block 的线程数；
-- 寄存器占用；
-- Shared Memory 占用；
-- GPU SM 数量；
-- 实际可同时驻留的 Block 数量。
-
-此外，`DeviceSyncer` 默认构造函数没有显式清零成员。全局静态 `__device__` 对象通常可依赖静态零初始化，但动态分配或复用时应明确保证计数器初值正确。
-
----
-
-# 17. 与昇腾 NPU 的对比
-
-这部分是理解 GPU SM Copy 为什么能工作、而 NPU 上逐元素 GM 访问往往很慢的关键。
-
-## 17.1 NVIDIA GPU 的典型模型
-
-GPU 依靠：
-
-```text
-大量 Thread
-  ↓
-每 32 个组成 Warp
-  ↓
-Warp 合并连续 Global Load/Store
-  ↓
-多个 Warp 隐藏内存延迟
-```
-
-也就是说：
-
-> GPU 的线程系统本身就是大规模内存并发请求生成器。
-
-一个线程一次搬 16B 并不可怕，因为：
-
-```text
-32 Thread/Warp
-× 多个 Warp/SM
+16B / Thread
+× 32 Thread / Warp
+× 多个 Warp / SM
 × 多个 SM
++ 连续地址合并
++ 足够 Outstanding 请求
 ```
 
-会共同产生高并发和高带宽。
+如果在昇腾上仅仅换一个 16B 结构体，然后调用逐元素 GM 读写，通常缺少：
 
-## 17.2 昇腾 NPU 的典型模型
+- 32 Lane Warp；
+- Warp Coalescer；
+- 大量 Active Warp；
+- Warp Scheduler 的延迟隐藏；
+- 由这些 Warp 产生的大量 Outstanding 请求。
 
-昇腾 AI Core 更强调显式数据搬运流水：
+所以：
 
 ```text
-GM
- ↓ MTE2
-UB / L1
- ↓ Vector / Cube 计算
-UB / L1
- ↓ MTE3
-GM
+“使用 16B 类型”只是访问粒度
+“达到高带宽”还需要并发生成机制
 ```
 
-主要流水可粗略理解为：
+类型相同，不代表吞吐机制相同。
 
-- `PIPE_S`：标量指令和少量控制访问；
-- `PIPE_V`：向量计算；
-- `PIPE_M`：矩阵计算；
-- `PIPE_MTE2`：GM → UB/L1；
-- `PIPE_MTE3`：UB → GM；
-- SDMA：适合某些大块数据搬运和通信场景。
+## 17.6 为什么昇腾 GM→UB→GM 多一跳反而更快
 
-因此在昇腾上使用类似：
+表面看：
+
+```text
+直接方式：GM → GM
+MTE 方式：GM → UB → GM
+```
+
+MTE 方式多了一次 UB 中转，似乎应该更慢。但性能不能只数“经过几站”，还要看每一站使用什么硬件。
+
+```mermaid
+flowchart TB
+    subgraph Slow[逐元素标量路径]
+        S1[标量读少量字节] --> S2[标量写少量字节]
+        S2 --> S3[重复许多次]
+    end
+
+    subgraph Fast[MTE 批量路径]
+        F1[一次描述一整个 Tile] --> F2[MTE2 形成连续 Burst]
+        F2 --> F3[UB]
+        F3 --> F4[MTE3 形成连续 Burst]
+    end
+```
+
+MTE 路径的优势：
+
+- 一条描述覆盖整块数据；
+- 形成较大 Burst；
+- 支持 Block、BlockLen 和 Stride；
+- 允许多个请求在途；
+- 搬运是异步流水；
+- 可以与 Vector/Cube 计算重叠；
+- 可以使用双缓冲或多缓冲。
+
+在 Ascend 开源代码的 GM→GM 示例中，真实做法就是按 Tile 执行：
+
+```text
+CpGM2UB
+→ MTE2 到 MTE3 的事件同步
+→ CpUB2GM
+→ MTE3 到 MTE2 的事件同步
+→ 处理下一个 Tile
+```
+
+参考：
+
+- [Ascend RecSDK `datacopy_gm2gm.h`](https://github.com/Ascend/RecSDK/blob/fe03cbbbde249a70b85b9d6fd68ebc627bbf6457/cust_op/ascendc_op/ai_core_op/lccl/v220/op_kernel/datacopy_gm2gm.h)
+
+这说明对典型 AI Core 编程模型而言，UB 并不是“无意义绕路”，而是连接批量搬运流水和 Vector/Cube 计算的数据站点。
+
+## 17.7 两种架构如何隐藏延迟
+
+### GPU：线程级延迟隐藏
+
+```mermaid
+sequenceDiagram
+    participant W0 as Warp 0
+    participant SM as Warp Scheduler
+    participant W1 as Warp 1
+    participant MEM as Memory/Interconnect
+    W0->>MEM: 发起 Load
+    MEM-->>W0: 等待中
+    SM->>W1: 切换并执行其他 Warp
+    MEM-->>W0: 数据返回
+    SM->>W0: 恢复执行
+```
+
+### 昇腾：流水级延迟隐藏
+
+```mermaid
+sequenceDiagram
+    participant M2 as MTE2
+    participant V as Vector/Cube
+    participant M3 as MTE3
+    M2->>M2: 搬入 Tile 1
+    V->>V: 计算 Tile 0
+    M3->>M3: 写回 Tile -1
+    Note over M2,M3: 双缓冲/多缓冲让三个阶段尽量重叠
+```
+
+两者目标相同：不要让高延迟使整个芯片停下来；但实现方法完全不同。
+
+## 17.8 为什么不能直接照搬编程：七个根因
+
+### 根因 1：执行粒度不同
+
+CUDA 的一个标量语句会被 32 Lane Warp 成组执行；昇腾标量语句不会自动变成 32 Lane Warp 访问。
+
+### 根因 2：内存请求聚合机制不同
+
+GPU 依赖相邻 Lane 的地址形成合并事务；昇腾 MTE 依赖搬运参数显式描述 Block、长度和 Stride。
+
+### 根因 3：延迟隐藏机制不同
+
+GPU 用大量 Warp 切换隐藏延迟；昇腾用 MTE2、Vector/Cube、MTE3 以及双缓冲重叠流水。
+
+### 根因 4：高吞吐数据层级不同
+
+GPU 编程天然允许大量线程直接操作 Global Memory；昇腾 Vector/Cube 的高效计算通常围绕 UB/L1 展开，GM 由 MTE 批量搬入搬出。
+
+### 根因 5：异步完成模型不同
+
+MTE 搬运通常是异步的。函数或指令提交完成，不代表数据已经可以被下一条流水安全消费，需要 Queue/Event 或 SetFlag/WaitFlag 建立依赖。
+
+### 根因 6：跨卡通路和可访问能力不同
+
+CUDA Peer Pointer、NVLink P2P、昇腾远端 GM、HCCS、SDMA 和通信库支持范围不是同一套抽象。某条本地 GM 路径能够工作，不代表相同指针语义可直接用于跨卡。
+
+### 根因 7：功能可移植不等于性能可移植
+
+把代码翻译到“结果正确”只完成了功能移植；还必须把并发、Tile、数据层级、流水和同步重新映射，才能完成性能移植。
+
+## 17.9 错误迁移与正确迁移
+
+### 错误思路：逐行翻译
+
+```text
+CUDA threadId 循环
+→ 换成 Ascend 核内循环
+
+longlong2 load/store
+→ 换成 16B 结构体 GetValue/SetValue
+
+__syncthreads
+→ 随便加一个 Barrier
+```
+
+这种翻译可能功能正确，但性能和同步都可能不正确。
+
+### 正确思路：迁移“目的”，不是迁移“表面语句”
+
+| CUDA/MSCCL++ 中的目的 | 昇腾侧应重新设计为 |
+|---|---|
+| 多线程分摊整段数据 | 多核分片 + 每核 Tile 化 |
+| Warp 连续合并访问 | MTE 连续 Block/BlockLen/Stride |
+| 多 Warp 隐藏访存延迟 | 双缓冲、多缓冲、MTE/Vector/MTE 重叠 |
+| `longlong2` 增大每 Lane 粒度 | 增大 Tile 和 Burst，满足对齐要求 |
+| SM 发起 Peer Load/Store | 根据芯片和软件栈选择远端 MTE、SDMA、HCCL/HCCS 路径 |
+| Block/Grid 同步 | 根据范围选择 Queue/Event、SetFlag/WaitFlag、核间同步 |
+| 数据搬完后 Signal | 先确认对应 MTE/SDMA 完成，再发布远端可见信号 |
+
+## 17.10 一个更合理的昇腾 GM→GM 思路
+
+伪代码仅表达设计思想：
 
 ```cpp
-value = global.GetValue(i);
-global.SetValue(i, value);
+for (每个分配给当前 AI Core 的 tile) {
+    // 1. MTE2：批量搬入，不是逐元素 GetValue
+    DataCopy(localBuffer, srcGlobal[tileOffset], tileBytes);
+
+    // 2. 等待 MTE2 → 消费流水的数据依赖
+    WaitCopyInReady();
+
+    // 3. 可选：在 UB 上执行 Vector/Cube 计算
+    // Compute(localBuffer);
+
+    // 4. MTE3：批量写出
+    DataCopy(dstGlobal[tileOffset], localBuffer, tileBytes);
+
+    // 5. 通过 Queue/Event 管理 Buffer 复用和下一 Tile
+    WaitCopyOutOrRotateBuffer();
+}
 ```
 
-逐元素访问 GM，通常走标量访问路径，不会自动变成 NVIDIA Warp 式的 32 Lane 合并访存。
+若是纯跨卡大块复制，还应优先评估专用 SDMA 或通信库，而不是强行占用 AI Core 做逐元素循环。
 
-## 17.3 为什么同样的 16B 写法表现不同
+## 17.11 跨卡对比
 
+```mermaid
+flowchart TB
+    subgraph GPU[GPU SM 驱动通信]
+        G1[多个 Warp] --> G2[大量 Peer Load/Store]
+        G2 --> G3[NVLink / NVSwitch / PCIe P2P]
+        G3 --> G4[远端 HBM]
+    end
+
+    subgraph NPU[NPU 典型批量通信]
+        N1[MTE / SDMA / 通信库描述] --> N2[批量 Burst 和在途请求]
+        N2 --> N3[HCCS / PCIe / 其他互联]
+        N3 --> N4[远端 HBM]
+    end
+```
+
+两者的共同目标是：
+
+> 产生足够大的请求粒度和足够高的并发，填满内存与互联带宽。
+
+不同点是“谁负责产生这些请求”。
+
+## 17.12 最终对照口诀
+
+```text
 NVIDIA GPU：
+线程多 → Warp 多 → 合并访问 → 用 Warp 隐藏延迟
 
-```text
-一个线程 16B
-× 一个 Warp 32 线程
-= 每轮逻辑 512B
-
-再叠加大量 Warp 和 SM
+昇腾 NPU：
+Tile 大 → MTE/SDMA Burst → 流水重叠 → 用 Buffer/Event 隐藏延迟
 ```
 
-昇腾标量 GM 访问：
-
-```text
-标量流水发出小粒度请求
-→ 请求并发和 Burst 能力有限
-→ 很难填满 HBM 或 HCCS
-```
-
-所以合理对应关系不是：
+因此，合理对应关系不是：
 
 ```text
 GPU longlong2 Load/Store
 ≈ NPU GetValue/SetValue
 ```
 
-更接近：
+而更接近：
 
 ```text
-GPU 大量 Warp 合并 Load/Store
-≈ NPU MTE/SDMA 批量 Burst 搬运
+GPU 大量 Warp 的合并 Load/Store
+≈ NPU MTE/SDMA 的批量 Burst 搬运
 ```
 
-## 17.4 NPU 为什么要经过 UB
-
-表面看：
-
-```text
-GM → UB → GM
-```
-
-比直接：
-
-```text
-GM → GM
-```
-
-多了一跳。
-
-但 MTE 是面向批量搬运设计的：
-
-- 通过描述符描述整块数据；
-- 形成 Burst；
-- 支持 Stride；
-- 支持异步流水；
-- 可以与 Vector/Cube 计算重叠；
-- 可以使用双缓冲或多缓冲。
-
-因此即使经过 UB，整体吞吐通常仍明显优于标量逐元素 GM 访问。
-
-## 17.5 跨卡场景
-
-GPU SM Copy：
-
-```text
-大量 Warp
-→ 大量 Outstanding P2P 请求
-→ NVLink / PCIe
-```
-
-昇腾更常见的高吞吐方式：
-
-```text
-MTE / SDMA 描述符
-→ 连续 Burst
-→ HCCS / PCIe / 其他互联
-```
-
-两者目标相同：
-
-> 产生足够大的请求粒度和足够高的并发，填满内存与互联带宽。
-
-只是编程和硬件机制不同。
+> 注意：昇腾不同芯片代际、软件版本和数据通路能力可能不同。具体是否支持某种直接 GM→GM、远端 GM 或专用指令，应以目标产品的 Ascend C API 和性能实测为准。本文描述的是典型的性能模型，而不是声称所有产品只有唯一实现。
 
 ---
 
@@ -1215,124 +923,84 @@ MTE / SDMA 描述符
 
 ## 误区 1：`longlong2 reg` 位于远端 GPU
 
-错误。
-
-`reg` 属于当前执行 Kernel 的线程，物理资源位于当前 GPU 的 SM Register File。
-
-远端的是 `src` 或 `dst` 指针所映射的 HBM。
+错误。`reg` 属于当前执行 Kernel 的线程，远端的是指针映射的 HBM。
 
 ## 误区 2：Global Load 一定读取本地 HBM
 
-错误。
-
-Global 是地址空间概念，地址可能映射到本地 HBM、Peer HBM 或 Host Memory。
+错误。Global 是地址空间概念，可以映射到本地、Peer 或 Host Memory。
 
 ## 误区 3：`dst[i] = src[i]` 是 DMA
 
-错误。
-
-在当前 MSCCL++ `copy()` 实现中，它是由 SM 执行的 Load 到寄存器、再 Store 到目标地址。
+错误。当前 MSCCL++ `copy()` 是 SM 执行 Load 到寄存器，再 Store 到目标地址。
 
 ## 误区 4：一个线程搬 16B，所以一定很慢
 
-不完整。
+不完整。GPU 性能来自 Warp、多活跃 Warp、多 SM 和合并访存。
 
-GPU 性能来自 Warp、多个活跃 Warp 和多个 SM 的大规模并行。
+## 误区 5：把类型换成 16B，NPU 就能得到 GPU Warp 带宽
 
-## 误区 5：`getPackets()` 是从远端取 Packet
+错误。类型只决定单次访问粒度，不会自动创建 Warp、Coalescer 和大量 Outstanding 请求。
 
-错误。
+## 误区 6：GM→UB→GM 多一跳必然更慢
 
-它只是 `unpackPackets()` 的已废弃别名，操作的是本地 `packetBuffer_`。
+错误。专用 MTE 批量流水可能远快于标量逐元素 GM→GM。
 
-## 误区 6：`__syncthreads()` 能同步整个 Kernel
+## 误区 7：`getPackets()` 是从远端取 Packet
 
-错误。
+错误。它只是 `unpackPackets()` 的已废弃别名。
 
-它只能同步一个 Block。多个 Block 需要 Grid Cooperative Groups 或类似 `DeviceSyncer` 的全局同步机制。
+## 误区 8：`__syncthreads()` 能同步整个 Kernel
 
-## 误区 7：普通 write 后立刻 signal 一定安全
+错误。它只同步一个 Block。
 
-不一定。
+## 误区 9：普通 Write 后立刻 Signal 一定安全
 
-需要确认：
+不一定。必须确认所有线程完成、跨 Block 同步、Release/Fence 和接收侧 Acquire。
 
-- 所有线程是否已完成数据写入；
-- 是否存在跨 Block 协作；
-- Signal 是否带有合适的 Release/Fence 语义；
-- 接收方 Wait 是否带有对应的 Acquire 语义。
+## 误区 10：CUDA 代码逐行翻译成 Ascend C 就完成移植
 
-## 误区 8：NVIDIA 的线程 Load/Store 写法可以原样移植到昇腾
-
-错误。
-
-两者的高吞吐数据路径不同。昇腾通常应使用 MTE/SDMA 和显式流水，而不是标量逐元素 GM 访问。
+错误。逐行翻译可能只完成功能移植；性能移植必须重构并发、Tile、内存层级、流水和同步。
 
 ---
 
 # 19. 性能分析建议
 
-分析 `put/get` 时，建议至少比较：
+分析 GPU `put/get` 时建议比较：
 
 1. `put()`；
 2. `get()`；
 3. `cudaMemcpyPeerAsync()`；
-4. 不同 Alignment：4/8/16；
-5. 不同 Block Size：128/256/512/1024；
-6. 不同 Grid Size；
-7. NVLink 和 PCIe 拓扑；
-8. 不同消息大小；
-9. 单次搬运与通信计算融合场景；
-10. 是否使用 Packet 协议。
+4. Alignment 4/8/16；
+5. 不同 Block Size 和 Grid Size；
+6. NVLink、NVSwitch 和 PCIe 拓扑；
+7. 不同消息大小；
+8. 单纯复制与通信计算融合；
+9. Packet 与非 Packet。
 
 重点观察：
 
 - 有效链路吞吐；
 - SM Occupancy；
-- 寄存器数量；
-- Register Spill；
-- Warp Stall 原因；
-- Memory Dependency Stall；
+- 寄存器数量和 Spill；
+- Warp Stall / Memory Dependency；
 - Global Load/Store 效率；
-- L2 吞吐；
-- NVLink Tx/Rx；
-- PCIe P2P 带宽；
+- L2、HBM、NVLink、PCIe 吞吐；
 - 同步和轮询开销。
 
-## 19.1 典型性能曲线
+分析昇腾方案时建议比较：
 
-通常会经历三个阶段：
+1. 标量 `GetValue/SetValue` 基线；
+2. MTE2/MTE3 Tile 搬运；
+3. 单 Buffer、双 Buffer、多 Buffer；
+4. 不同 Tile Size；
+5. 对齐与 Stride；
+6. AI Core MTE 与 SDMA/通信库；
+7. 本卡与跨卡；
+8. Event/Queue 等待开销；
+9. HBM/HCCS 实际吞吐；
+10. 是否成功实现搬运和计算重叠。
 
-```text
-线程太少：
-延迟隐藏不足，带宽低
-
-线程适中：
-Outstanding 请求增加，带宽快速上升
-
-线程过多：
-链路或 HBM 已饱和，继续增加线程收益很小，
-还可能增加资源占用和同步开销
-```
-
-## 19.2 不要只看理论峰值
-
-实际瓶颈可能出现在：
-
-```text
-SM Load/Store Pipeline
-L2
-本地 HBM
-远端 HBM
-NVLink
-NVSwitch
-PCIe
-P2P 拓扑
-同步协议
-Packet 元数据开销
-```
-
-因此必须用 Profiler 和端到端基准判断。
+不要只看理论峰值，必须结合 Profiler 和端到端基准定位瓶颈。
 
 ---
 
@@ -1340,9 +1008,9 @@ Packet 元数据开销
 
 `MemoryChannelDeviceHandle` 的核心思想是：
 
-> 把远端 GPU 内存映射成当前 GPU Kernel 可直接访问的地址，让 GPU SM 自己发起通信，而不是每次返回 Host 调用复制接口。
+> 把远端 GPU 内存映射成当前 GPU Kernel 可访问的地址，让 GPU SM 自己发起通信，而不是每次返回 Host 调用复制接口。
 
-普通 `put()` 的数据路径：
+`put()`：
 
 ```text
 本地 HBM
@@ -1351,7 +1019,7 @@ Packet 元数据开销
 → 远端 HBM
 ```
 
-普通 `get()` 的数据路径：
+`get()`：
 
 ```text
 远端 HBM
@@ -1364,41 +1032,53 @@ Packet 元数据开销
 
 - SM 是执行 Kernel 的计算单元；
 - Warp 是 NVIDIA 调度的 32 线程基本单位；
-- 每个线程拥有自己的逻辑寄存器；
 - 寄存器位于当前 GPU SM；
 - Global Load/Store 可访问本地或映射后的远端地址；
 - 高带宽依赖 Warp 合并访存和大量并发请求；
-- `longlong2` 一次搬 16B，只是单线程视角；
-- 一个 Warp 每轮逻辑上可以处理 512B；
+- `longlong2` 一次搬 16B 只是单线程视角；
+- 一个 Warp 每轮逻辑上可处理 512B；
 - `put/get` 不保证在所有场景下比专用 Copy Engine 更快；
-- 它最大的价值是 GPU 驱动通信、低延迟和通信计算融合；
-- Packet 协议通过 Payload + Flag 实现细粒度到达检测；
-- DeviceSyncer 用于多个 Block 的阶段同步；
-- 昇腾 NPU 更应使用 MTE/SDMA 批量搬运，而不是照搬 GPU 的逐线程 Global Load/Store 思路。
+- Packet 通过 Payload + Flag 实现细粒度到达检测；
+- DeviceSyncer 用于多个 Block 的阶段同步。
 
-一句话概括：
+GPU 与昇腾对比的最终结论：
 
-> NVIDIA GPU 用大量 Warp 把普通 Load/Store 变成高并发数据流；昇腾 NPU 则更多依赖 MTE/SDMA 把批量搬运变成高吞吐数据流。
+> NVIDIA GPU 用大量 Warp 把普通 Load/Store 组织成高并发数据流；昇腾 NPU 通常用 MTE/SDMA 把 Tile 描述组织成批量 Burst 数据流。
+
+所以不能直接照搬编程的根因不是语法不同，而是：
+
+```text
+执行粒度不同
++ 请求聚合机制不同
++ 延迟隐藏机制不同
++ 高效数据层级不同
++ 异步完成和同步模型不同
++ 跨卡通路不同
+```
+
+移植时应牢记：
+
+> 翻译代码语句只能保证“可能算对”；重新映射硬件并发和数据通路，才能“跑得对、跑得快”。
 
 ---
 
 ## 源码阅读顺序建议
-
-初学者推荐按以下顺序阅读：
 
 1. [`include/mscclpp/memory_channel_device.hpp`](include/mscclpp/memory_channel_device.hpp)
 2. [`include/mscclpp/copy_device.hpp`](include/mscclpp/copy_device.hpp)
 3. [`include/mscclpp/packet_device.hpp`](include/mscclpp/packet_device.hpp)
 4. [`include/mscclpp/semaphore_device.hpp`](include/mscclpp/semaphore_device.hpp)
 5. [`include/mscclpp/concurrency_device.hpp`](include/mscclpp/concurrency_device.hpp)
-6. `examples/tutorials/03-memory-channel/` 下的示例
+6. `examples/tutorials/03-memory-channel/`
+7. [Ascend RecSDK `datacopy_gm2gm.h`](https://github.com/Ascend/RecSDK/blob/fe03cbbbde249a70b85b9d6fd68ebc627bbf6457/cust_op/ascendc_op/ai_core_op/lccl/v220/op_kernel/datacopy_gm2gm.h)
 
-阅读时始终带着三个问题：
+阅读时始终带着四个问题：
 
 ```text
 谁在执行？
 数据物理上在哪里？
+谁在产生高并发内存请求？
 完成和可见性由什么同步机制保证？
 ```
 
-只要这三个问题能回答清楚，MSCCL++ 的 MemoryChannel 数据路径就基本理解了。
+只要这四个问题能回答清楚，就不容易把 GPU 的 Warp 模型和 NPU 的 MTE/SDMA 模型混为一谈。
