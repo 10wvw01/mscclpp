@@ -510,11 +510,12 @@ Packet 协议把小粒度的“数据”和“到达标志”放在同一个 Pac
 
 ## 14.2 发送端和接收端连在一起的完整主图
 
-假设 GPU 0 向 GPU 1 发送 Packet。下面这张图把发送端、互联、接收端、轮询和最终解包目标连成一条完整链路：
+假设 GPU 0 向 GPU 1 发送 Packet。下面这张图把发送端、互联、接收端、轮询和最终解包目标按照从上到下的顺序连成一条完整链路：
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph SEND[GPU 0 发送端]
+        direction TB
         S0[HBM 中的本地 src_<br/>普通 Payload]
         S1[GPU 0 SM<br/>线程寄存器]
         S2[copyToPackets<br/>组合 Payload + flag]
@@ -527,6 +528,7 @@ flowchart LR
     LINK --> PBUF[GPU 1 HBM 中的同一块 Packet Buffer<br/>发送端视角：remote dst_<br/>接收端视角：local packetBuffer_]
 
     subgraph RECV[GPU 1 接收端]
+        direction TB
         R1[GPU 1 SM<br/>ld.volatile.global 读取 Packet]
         R2{Flag 等于<br/>expectedFlag?}
         R3[提取 Payload<br/>进入 GPU 1 线程寄存器]
@@ -540,18 +542,26 @@ flowchart LR
     R2 -- 否：继续轮询 --> PBUF
 ```
 
-这张图必须从左到右连起来理解：
+这张图必须从上到下连起来理解：
 
 ```text
 GPU 0 本地 src_
-→ GPU 0 SM 读取 Payload
-→ 加入 Flag，形成 Packet
-→ 对远端 dst_ 发出 Volatile Global Store
-→ NVLink / NVSwitch / PCIe P2P
-→ GPU 1 HBM 中的 Packet Buffer
-→ GPU 1 SM 反复 Volatile Load 并检查 Flag
-→ Flag 匹配后提取 Payload
-→ 写入 GPU 1 本地 src_
+↓
+GPU 0 SM 读取 Payload
+↓
+加入 Flag，形成 Packet
+↓
+对远端 dst_ 发出 Volatile Global Store
+↓
+NVLink / NVSwitch / PCIe P2P
+↓
+GPU 1 HBM 中的 Packet Buffer
+↓
+GPU 1 SM 反复 Volatile Load 并检查 Flag
+↓
+Flag 匹配后提取 Payload
+↓
+写入 GPU 1 本地 src_
 ```
 
 最关键的地址关系是：
