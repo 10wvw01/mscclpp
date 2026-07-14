@@ -41,6 +41,47 @@ flowchart LR
     A2 -->|release + system-scope token 加一| B0
     B0 --> B1 --> B2
 ```
+把仓库示例的两个阶段展开后，完整时序如下。第一阶段只对齐双方 Kernel 的执行进度，因此使用 relaxed 接口；第二阶段需要交接 `put()` 的数据完成状态，因此使用严格的 release/acquire 接口。
+
+```mermaid
+sequenceDiagram
+    participant AG as GPU A 全部参与线程
+    participant A0 as GPU A leader（tid == 0）
+    participant B0 as GPU B leader（tid == 0）
+    participant BG as GPU B 全部参与线程
+
+    rect rgb(245, 245, 245)
+        Note over AG,BG: 阶段一：双方 Kernel 启动对齐，只同步执行进度
+        par 双方发送“我已启动”
+            A0->>B0: relaxedSignal()：原子增加 token B
+        and
+            B0->>A0: relaxedSignal()：原子增加 token A
+        end
+        A0->>A0: relaxedWait()：等待 token A
+        B0->>B0: relaxedWait()：等待 token B
+        AG->>AG: DeviceSyncer.sync()：A 的全部 Block 放行
+        BG->>BG: DeviceSyncer.sync()：B 的全部 Block 放行
+    end
+
+    rect rgb(235, 245, 255)
+        Note over AG,BG: 阶段二：全部线程并行搬运数据，再交接数据完成状态
+        par 双向 put
+            AG->>BG: 并行写入 GPU B 的远端内存
+        and
+            BG->>AG: 并行写入 GPU A 的远端内存
+        end
+        AG->>AG: DeviceSyncer.sync()：确认 A 全部写线程完成
+        BG->>BG: DeviceSyncer.sync()：确认 B 全部写线程完成
+        par 双方发布“数据已完成”
+            A0->>B0: signal()：release/system token B + 1
+        and
+            B0->>A0: signal()：release/system token A + 1
+        end
+        A0->>A0: wait()：acquire 观察 token A
+        B0->>B0: wait()：acquire 观察 token B
+        Note over AG,BG: wait 返回后，对端在 signal 前发布的数据已可见
+    end
+```
 
 ---
 
