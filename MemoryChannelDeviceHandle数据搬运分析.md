@@ -5,7 +5,7 @@
 > 本文尽量同时做到两点：
 >
 > 1. 保持技术描述准确，便于继续阅读源码和分析性能；
-> 2. 使用通俗类比、流程图和对照表解释 SM、Warp、寄存器、Global Load/Store、Packet、远端显存、MTE/SDMA 和同步。
+> 2. 使用通俗类比、流程图和对照表解释 SM、Warp、寄存器、Global Load/Store、Packet、远端显存、MTE/SDMA、同步和上层 DSL。
 
 ---
 
@@ -31,6 +31,7 @@
 - [18. 常见误区](#18-常见误区)
 - [19. 性能分析建议](#19-性能分析建议)
 - [20. 最终总结](#20-最终总结)
+- [21. XCCL++ DSL 入门：从算法描述到 NPU 执行](#21-xccl-dsl-入门从算法描述到-npu-执行)
 
 ---
 
@@ -66,7 +67,8 @@
 - Packet 路径会把 Payload 和代表轮次的 Flag 一起写入接收端 Packet Buffer；
 - `getPackets()` 不是“从远端拉 Packet”，它只是已废弃的本地 Packet 解包接口别名；
 - `DeviceSyncer` 用于同一 Kernel 内多个 Block 的阶段同步；
-- NVIDIA GPU 和昇腾 NPU 的高吞吐请求生成器不同，因此代码不能只做语法翻译。
+- NVIDIA GPU 和昇腾 NPU 的高吞吐请求生成器不同，因此代码不能只做语法翻译；
+- XCCL++ DSL 位于更上层，用 Python 描述 Channel、数据流和同步，编译后才落实为设备端执行计划。
 
 相关源码：
 
@@ -95,7 +97,7 @@ struct MemoryChannelDeviceHandle : public BaseMemoryChannelDeviceHandle {
 Host 侧负责：
 
 - 创建和注册内存；
-- 建立 CUDA IPC 或其他可访问映射；
+- 建立 CUDA IPC、VMM 或其他可访问映射；
 - 创建 Semaphore；
 - 把最终可供 GPU 使用的地址封装进 DeviceHandle。
 
@@ -1290,6 +1292,10 @@ GM
 
 错误。两者的高吞吐请求生成器不同，昇腾通常应使用 MTE/SDMA 和显式流水。
 
+## 误区 11：使用 DSL 就不需要理解底层数据路径
+
+错误。DSL 能降低编程门槛，但对齐、缓冲区容量、Channel 选择、同步依赖和硬件拓扑仍然决定正确性与性能。
+
 ---
 
 # 19. 性能分析建议
@@ -1412,11 +1418,12 @@ Packet 路径最关键的地址关系是：
 - LL16 和 LL8 的 Payload 效率均为 50%；
 - Volatile 不能被简单当成完整 Release/Acquire；
 - DeviceSyncer 用于多个 Block 的阶段同步；
-- 昇腾 NPU 更应使用 MTE/SDMA 批量搬运，而不是照搬 GPU 的逐线程 Global Load/Store。
+- 昇腾 NPU 更应使用 MTE/SDMA 批量搬运，而不是照搬 GPU 的逐线程 Global Load/Store；
+- XCCL++ DSL 将 Channel、同步和数据操作组织为可编译的执行计划，但底层仍受上述硬件和内存语义约束。
 
 一句话概括：
 
-> 普通 MemoryChannel 用大量 Warp 把 Load/Store 变成高并发数据流；Packet Channel 则在同一条发送端到接收端的远端写入链路上加入 Flag，让接收端能够按 Packet 判断“这一小块数据是否已经属于当前轮次并且可以解包”。
+> 普通 MemoryChannel 用大量 Warp 把 Load/Store 变成高并发数据流；Packet Channel 在同一条远端写入链路上加入 Flag；DSL 再把这些底层能力组合成可复用的集合通信算法。
 
 ---
 
@@ -1441,3 +1448,849 @@ Packet 路径最关键的地址关系是：
 ```
 
 只要这四个问题能够回答清楚，MemoryChannel 和 Packet Channel 的数据路径就基本理解了。
+
+---
+
+# 21. XCCL++ DSL 入门：从算法描述到 NPU 执行
+
+> 本节根据《XCCL++ DSL 介绍 v1.1》整理，API 名称沿用 PPT 中的 `xcclpp`。
+>
+> PPT 中部分接口参数沿用了 `stream`、`block` 等兼容命名。具体类型、默认值和可用后端应以当前代码版本为准。
+
+## 21.1 DSL 是什么
+
+DSL 是 Domain-Specific Language，中文通常称为“领域特定语言”。
+
+XCCL++ DSL 提供基于 Python 的通信算法描述接口，目标是让开发者能够通过 Python 描述：
+
+- 哪些 Rank 参与通信；
+- 创建哪种 Channel；
+- 数据从哪个 Rank、哪个 Buffer、哪个 Offset 流向哪里；
+- 什么时候执行 `signal/wait`；
+- 什么时候执行 `put/get/copy/reduce/broadcast`；
+- 算法适用于多大的消息、多少张 NPU、哪种协议；
+- 最终如何编译并交给 NPU 执行。
+
+通俗地说：
+
+> 不再要求用户先手写一整套底层 CANN 通信 Kernel，而是先用 Python 画出“谁给谁搬什么、什么时候搬、搬完怎么通知”的执行蓝图。
+
+但 DSL 不是解释执行每一条 Python 语句。典型过程是：
+
+```text
+Python 描述算法
+→ 生成 CollectiveProgram
+→ 编译为 JSON 执行计划
+→ C++ Runtime 加载执行计划
+→ Executor 调度 NPU Kernel 和 Channel
+```
+
+## 21.2 DSL 与本文前面内容的关系
+
+前面章节主要解释的是设备端的具体搬运机制，例如：
+
+```text
+MemoryChannelDeviceHandle.put()
+MemoryChannelDeviceHandle.get()
+signal()/wait()
+Packet 编码和轮询
+```
+
+DSL 位于这些机制的上层：
+
+```mermaid
+flowchart TD
+    A[Python DSL<br/>描述拓扑、数据流、同步] --> B[CollectiveProgram]
+    B --> C[compile<br/>依赖解析、实例复制、资源规划]
+    C --> D[Algorithm / ExecutionPlan]
+    D --> E[Executor]
+    E --> F[设备端 Channel 与 Kernel]
+    F --> G[MemoryChannelDeviceHandle<br/>put/get/signal/wait]
+    F --> H[PortChannel<br/>异步通信路径]
+    F --> I[SwitchChannel<br/>规约/多播路径]
+```
+
+因此可以建立两层心智模型：
+
+```text
+上层：DSL 决定“算法要做什么”
+底层：Channel 和设备端 Handle 决定“硬件怎样完成”
+```
+
+DSL 能减少样板代码，但不会改变底层事实：
+
+- Channel 必须适配实际拓扑；
+- Buffer 地址和 Offset 必须正确；
+- 对齐和容量必须满足要求；
+- Signal/Wait 依赖必须正确；
+- 大块搬运仍需选择合适的数据通路；
+- 性能仍受链路、并发度和硬件搬运引擎约束。
+
+## 21.3 PPT 中的超节点拓扑与三类 Channel
+
+PPT 给出的拓扑是分层的 UB 超节点：
+
+```mermaid
+flowchart TD
+    subgraph RACK1[Rack 1]
+        N1[计算节点<br/>多张 NPU] --> L11[L1 UB 交换芯片]
+        N2[计算节点<br/>多张 NPU] --> L12[L1 UB 交换芯片]
+    end
+
+    subgraph RACK2[Rack 2]
+        N3[计算节点<br/>多张 NPU] --> L13[L1 UB 交换芯片]
+        N4[计算节点<br/>多张 NPU] --> L14[L1 UB 交换芯片]
+    end
+
+    L11 --> L2[L2 UB 总线交换设备]
+    L12 --> L2
+    L13 --> L2
+    L14 --> L2
+    L2 --> UB2E[UB2E]
+    UB2E --> ETH[Ethernet / 外部网络]
+```
+
+在这一模型中，PPT 将 Channel 分为三类：
+
+| Channel | PPT 中的定位 | 适合表达的操作 |
+|---|---|---|
+| `MemoryChannel` | 基于 UB OBMM 内存映射形成 NPU 内存池，NPU 可直接读写远端映射内存 | `put/get/read/write`、细粒度远端内存访问 |
+| `PortChannel` | 基于 RDMA 端口映射，支持 NPU 间异步读写远端内存 | 跨节点异步传输、端口化通信 |
+| `SwitchChannel` | 使用超节点交换能力完成多 NPU 规约和多播 | Reduce、Broadcast、规约后多播 |
+
+可以把它们理解为三种“运输工具”：
+
+```text
+MemoryChannel：拿到对方仓库地址，直接去对方仓库读写
+PortChannel：把任务交给 RDMA 端口，异步运输
+SwitchChannel：让交换设备在途中完成规约或一发多收
+```
+
+PPT 将 `SwitchChannel` 类比为 NVLS 一类的硬件规约/多播能力。这里应理解为功能层面的类比，不应把不同厂商的具体实现细节当成完全相同。
+
+## 21.4 DSL 的完整使用流程
+
+PPT 中的整体过程可以归纳为三阶段：
+
+1. 通信算法定义；
+2. 初始化与编译；
+3. 算法调用。
+
+完整竖向流程如下：
+
+```mermaid
+flowchart TD
+    A[定义 AlgoSpec<br/>算法运行条件] --> B[定义 Python 算法函数]
+    B --> C[在 CollectiveProgram 上下文中<br/>创建 Channel、同步和数据操作]
+    C --> D[输出 CollectiveProgram]
+    D --> E[xcclpp.compile]
+    E --> F[生成 JSON ExecutionPlan<br/>并返回 Algorithm]
+
+    G[初始化 CommGroup<br/>建立进程间连接和 Rank 拓扑] --> H[创建 Executor]
+    F --> I[CustomizedComm<br/>组合 CommGroup、Executor、Algorithm]
+    H --> I
+    G --> I
+
+    I --> J[调用 all_reduce/all_gather 等公共接口]
+    J --> K[Algorithm.execute]
+    K --> L[Executor 调度 NPU 执行]
+```
+
+最容易记住的简化版是：
+
+```text
+AlgoSpec：在什么条件下运行
+CollectiveProgram：数据如何流动
+compile：把蓝图变成执行计划
+CommGroup：参与者如何互相找到
+Executor：谁负责实际调度
+Algorithm.execute：本次拿哪些 Buffer 开始执行
+CustomizedComm：把以上对象封装成易用接口
+```
+
+## 21.5 第一步：AlgoSpec 定义“在什么条件下跑”
+
+`xcclpp.language.AlgoSpec` 描述算法的外围约束。
+
+示意代码：
+
+```python
+spec = xcclpp.language.AlgoSpec(
+    name="allgather_example",
+    collective=AllGather(...),
+    nranks_per_node=nranks_per_node,
+    world_size=world_size,
+    in_place=True,
+    instances=nranks_per_node,
+    protocol="Simple",
+    num_threads_per_block=1024,
+    min_message_size=1 << 20,
+    max_message_size=48 << 30,
+)
+```
+
+常见参数：
+
+| 参数 | 含义 |
+|---|---|
+| `name` | 算法名称或算法标识符 |
+| `collective` | 集合通信类型，如 AllReduce、AllGather |
+| `nranks_per_node` | 每个计算节点上的 NPU/Rank 数量 |
+| `world_size` | 全局 Rank 总数 |
+| `in_place` | 是否原地操作 |
+| `instances` | 算法流水实例或副本数量 |
+| `protocol` | 传输协议，如 `Simple` 或 `LL` |
+| `instr_fusion` | 是否启用指令融合 |
+| `auto_sync` | 是否让编译器自动补充部分同步 |
+| `replication_policy` | 多实例复制和排布策略 |
+| `reuse_resources` | 是否复用 Channel、Buffer 等资源 |
+| `num_threads_per_block` | 每个执行块的线程数 |
+| `use_double_scratch_buffer` | 是否使用双 Scratch Buffer |
+| `buffer_alignment` | Buffer 对齐字节数 |
+| `min_message_size` | 算法适用的最小消息字节数 |
+| `max_message_size` | 算法适用的最大消息字节数 |
+| `tags` | 自定义标签和算法元数据 |
+
+AlgoSpec 不负责描述具体通信步骤。
+
+例如：
+
+```text
+8 张 NPU 变成 16 张 NPU
+消息范围从 1 MB 变成 64 MB
+协议从 Simple 变成 LL
+```
+
+这些通常属于 AlgoSpec 的变化。
+
+可以把 AlgoSpec 理解为活动报名表：
+
+```text
+有多少人参加？
+在哪个场地？
+使用哪套规则？
+允许多大的输入？
+是否启用多条流水线？
+```
+
+## 21.6 第二步：CollectiveProgram 定义“数据怎样流动”
+
+DSL 算法通常是一个 Python 函数：
+
+```python
+def allgather_example(spec: AlgoSpec) -> CollectiveProgram:
+    with CollectiveProgram(
+        spec.name,
+        spec.collective,
+        spec.world_size,
+        instances=spec.instances,
+        protocol=spec.protocol,
+        instr_fusion=spec.instr_fusion,
+        auto_sync=spec.auto_sync,
+        replication_policy=spec.replication_policy,
+        reuse_resources=spec.reuse_resources,
+        num_threads_per_block=spec.num_threads_per_block,
+        use_double_scratch_buffer=spec.use_double_scratch_buffer,
+        buffer_alignment=spec.buffer_alignment,
+        min_message_size=spec.min_message_size,
+        max_message_size=spec.max_message_size,
+    ) as program:
+        # 在这里创建 Channel、同步并描述数据操作
+        ...
+
+    return program
+```
+
+函数内部通常按四个步骤组织：
+
+```mermaid
+flowchart TD
+    A[步骤 1：创建 Channel<br/>memory / port / switch] --> B[步骤 2：同步就绪<br/>signal / wait]
+    B --> C[步骤 3：数据操作<br/>reduce / broadcast / put / get / copy]
+    C --> D[步骤 4：同步完成<br/>确认本阶段可安全结束]
+```
+
+### 21.6.1 创建 Channel
+
+伪代码：
+
+```python
+memory_channels = {}
+port_channels = {}
+switch_channels = {}
+
+memory_channels[(dst_rank, src_rank)] = MemoryChannel(...)
+port_channels[(dst_rank, src_rank)] = PortChannel(...)
+switch_channels[group_id] = SwitchChannel(...)
+```
+
+Channel 决定数据实际走哪类硬件和运行时通路。
+
+### 21.6.2 同步就绪
+
+```python
+channel.signal(...)
+channel.wait(...)
+```
+
+这一阶段解决的是：
+
+```text
+接收端 Buffer 是否已经准备好？
+远端映射是否已经建立？
+当前通信轮次是否可以开始？
+```
+
+### 21.6.3 数据操作
+
+```python
+channel.put(...)
+channel.get(...)
+channel.copy(...)
+channel.reduce(...)
+channel.broadcast(...)
+```
+
+这些 DSL 操作会被记录到 `CollectiveProgram`，而不是在 Python 解释器中立即完成全部数据传输。
+
+### 21.6.4 同步完成
+
+数据操作之后通常还需要建立阶段边界：
+
+```text
+所有分片是否已经完成？
+后续操作是否依赖完整结果？
+是否可以复用 Buffer 或进入下一轮？
+```
+
+这与前文解释的 `DeviceSyncer`、Semaphore 和 Release/Acquire 问题属于同一类正确性问题，只是 DSL 可以帮助生成和组织部分依赖。
+
+## 21.7 AlgoSpec 与算法函数如何配合
+
+二者的关系可以画成：
+
+```mermaid
+flowchart LR
+    A[AlgoSpec<br/>外围约束] --> C[xcclpp.compile]
+    B[算法函数<br/>内部数据流逻辑] --> C
+    C --> D[Algorithm<br/>可执行对象]
+```
+
+区别：
+
+| 内容 | AlgoSpec | 算法函数 / CollectiveProgram |
+|---|---|---|
+| 关注点 | 算法适用条件 | 算法内部步骤 |
+| 典型问题 | 几张 NPU、消息多大、什么协议 | 谁给谁发、Offset 是多少、何时同步 |
+| 是否描述拓扑边 | 间接描述规模 | 直接创建 Channel 和 Rank 关系 |
+| 是否包含 put/get | 否 | 是 |
+| 是否影响编译缓存键 | 是 | 是 |
+
+一句话：
+
+> AlgoSpec 描述“舞台有多大”，算法函数描述“演员怎样走位”。
+
+## 21.8 第三步：CommGroup 建立进程和 Rank 拓扑
+
+`xcclpp.CommGroup()` 的主要职责：
+
+- 通过 TCP Bootstrap 建立进程间初始连接；
+- 收集各进程的 Rank 信息；
+- 让 Rank 0 作为默认 Master 汇总信息；
+- 将完整 Rank 信息广播给其他进程；
+- 创建 C++ 端 `CppCommunicator`；
+- 为 Executor 和 Algorithm 提供共同的通信上下文；
+- 建立 Rank 与 NPU 的一一绑定关系。
+
+关键属性：
+
+| 属性 | 说明 |
+|---|---|
+| `communicator` | C++ 端 Communicator，核心通信上下文 |
+| `interfaceIpPortTrio` | Master 所在网卡、IP、Port 信息 |
+| `rank` | 当前进程 Rank |
+| `nranks` | 全局 Rank 总数 |
+
+典型初始化：
+
+```python
+rank = int(os.environ["RANK"])
+world = int(os.environ["WORLD_SIZE"])
+master_addr = os.environ["xcclpp_MASTER_ADDR"]
+master_port = os.environ["xcclpp_MASTER_PORT"]
+
+interface_ip_port = f"{interface}:{master_addr}:{master_port}"
+
+comm_group = xcclpp.CommGroup(
+    interfaceIpPortTrio=interface_ip_port,
+    rank=rank,
+    size=world,
+)
+```
+
+组网过程：
+
+```mermaid
+sequenceDiagram
+    participant R0 as Rank 0 / Master
+    participant R1 as Rank 1
+    participant RN as 其他 Rank
+
+    R1->>R0: 上报本 Rank、节点和设备信息
+    RN->>R0: 上报本 Rank、节点和设备信息
+    R0->>R0: 汇总全局 Rank 拓扑
+    R0-->>R1: 广播完整拓扑
+    R0-->>RN: 广播完整拓扑
+    R1->>R1: 创建本地 Communicator 视图
+    RN->>RN: 创建本地 Communicator 视图
+```
+
+通俗类比：
+
+> CommGroup 像会议签到和通讯录分发。所有人先向主持人报到，主持人整理完整名单，再把名单发给每个人。
+
+## 21.9 第四步：`xcclpp.compile()` 生成执行计划
+
+PPT 中的编译过程分为五步：
+
+```mermaid
+flowchart TD
+    A[1. 调用算法函数<br/>产生 CollectiveProgram] --> B[2. 序列化为 JSON]
+    B --> C[依赖解析、同步处理、实例复制和优化]
+    C --> D[3. 写入编译缓存]
+    D --> E[4. CppExecutionPlan 加载 JSON]
+    E --> F[5. 返回 Algorithm]
+```
+
+示意调用：
+
+```python
+algorithms = []
+algo = xcclpp.compile(
+    algo=allgather_example,
+    algo_spec=spec,
+    rank=rank,
+)
+algorithms.append(algo)
+```
+
+编译阶段的主要工作：
+
+| 步骤 | 说明 |
+|---|---|
+| 调用算法函数 | 根据 `spec` 运行 Python 构图代码，得到 `CollectiveProgram` |
+| 序列化 | `CollectiveProgram.to_json()` 形成初始执行计划 |
+| 后处理 | 优化、解析同步依赖、复制多实例、分配资源 |
+| 缓存 | 将 JSON 写入缓存目录，避免相同算法重复编译 |
+| 创建 ExecutionPlan | C++ 端根据 Rank 加载计划并准备运行时对象 |
+| 返回 Algorithm | 封装 `id`、`execution_plan`、`tags` 和约束信息 |
+
+PPT 给出的缓存目录包括：
+
+```text
+MSCCLPP_CACHE_DIR
+或
+~/.cache/mscclpp
+```
+
+并以算法源码和 Spec 元数据的哈希作为缓存键。
+
+因此当以下内容变化时，通常应生成不同缓存项：
+
+- 算法函数逻辑；
+- Rank 数；
+- 协议；
+- 消息范围；
+- 实例数；
+- 对齐或线程配置。
+
+## 21.10 第五步：Executor 是实际调度者
+
+`xcclpp.Executor()` 接收 `CommGroup` 中的 Communicator，并负责把编译后的执行计划交给 NPU 运行。
+
+```python
+executor = xcclpp.Executor(comm_group.communicator)
+```
+
+核心对象关系：
+
+| 对象 | 职责 |
+|---|---|
+| `CommGroup` | 建立进程连接和全局 Rank 拓扑 |
+| `CppCommunicator` | C++ 端通信上下文和资源入口 |
+| `Algorithm` | 编译完成的执行计划及约束 |
+| `Executor` | 调度 NPU Kernel、Channel 和执行阶段 |
+
+通俗类比：
+
+```text
+Algorithm = 施工图纸
+Communicator = 工地通信和人员名册
+Executor = 现场总调度
+NPU Kernel/Channel = 真正施工的设备和工人
+```
+
+## 21.11 第六步：`Algorithm.execute()` 绑定本次 Buffer 并执行
+
+`Algorithm` 是编译后的算法模板；`execute()` 则为本次调用提供真实的 Buffer、大小、数据类型和 Stream。
+
+示意：
+
+```python
+algo.execute(
+    comm=comm_group.communicator,
+    executor=executor,
+    input_buffer=tensor.data_ptr(),
+    output_buffer=tensor.data_ptr(),
+    input_size=tensor.nbytes,
+    output_size=tensor.nbytes,
+    dtype=to_xcclpp_dtype(tensor.dtype),
+    stream=stream_handle,
+)
+```
+
+PPT 中列出的主要参数：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `comm` | `CppCommunicator` | 通信器 |
+| `input_buffer` | `int` | 输入缓冲区 NPU 地址 |
+| `output_buffer` | `int` | 输出缓冲区 NPU 地址 |
+| `input_size` | `int` | 输入字节数 |
+| `output_size` | `int` | 输出字节数 |
+| `dtype` | `DataType` | 元素数据类型 |
+| `op` | `ReduceOp` | 规约操作，默认可为 NOP |
+| `stream` | `int` | 运行时 Stream 句柄 |
+| `executor` | `CppExecutor` | DSL 算法执行器 |
+| `nblocks` | `int` | 执行块数量，0 表示自动 |
+| `nthreads_per_block` | `int` | 每个块线程数，0 表示自动 |
+| `symmetric_memory` | `bool` | 是否使用对称内存 |
+| `extras` | `dict` | 算法特定参数 |
+| `accum_dtype` | `DataType` | 累加数据类型 |
+
+需要区分：
+
+```text
+compile()：生成“算法模板”
+execute()：为模板绑定本次真实数据并启动执行
+```
+
+同一个 `Algorithm` 可以在满足约束的情况下被多次执行，但每次可以传入不同的 Buffer 地址和 Stream。
+
+## 21.12 第七步：CustomizedComm 封装公共 API
+
+直接管理 `CommGroup + Algorithm + Executor` 对业务调用者仍然偏复杂，因此 PPT 使用 `CustomizedComm` 再封装一层。
+
+示意：
+
+```python
+class CustomizedComm:
+    def __init__(self, comm: xcclpp.CommGroup, algorithms=None):
+        self.comm = comm
+        self.rank = comm.my_rank
+        self.world_size = comm.nranks
+        self.local_rank = comm.my_rank % comm.nranks_per_node
+        self.executor = xcclpp.Executor(comm.communicator)
+        self.algorithms = algorithms or []
+
+    def all_gather(self, tensor, stream=None):
+        algo = self.algorithms[0]
+        algo.execute(
+            comm=self.comm.communicator,
+            executor=self.executor,
+            input_buffer=tensor.data_ptr(),
+            output_buffer=tensor.data_ptr(),
+            input_size=tensor.nbytes,
+            output_size=tensor.nbytes,
+            dtype=to_xcclpp_dtype(tensor.dtype),
+            stream=stream_handle(stream),
+        )
+```
+
+上层使用者最终只需要：
+
+```python
+comm = init_dist()
+comm.barrier_cpu()
+comm.all_gather(x, stream=current_stream)
+comm.barrier_cpu()
+comm.destroy()
+```
+
+这使接口风格接近 `torch.distributed`：
+
+```text
+用户看到的是 all_gather/all_reduce
+内部实际组合了 CommGroup、Executor 和 Algorithm.execute
+```
+
+## 21.13 一个从定义到执行的最小骨架
+
+下面把 PPT 的七个步骤放到一个简化示例中。它用于建立整体心智模型，并不是可直接运行的完整实现。
+
+```python
+import os
+import xcclpp
+
+
+def build_spec(world_size: int, nranks_per_node: int):
+    return xcclpp.language.AlgoSpec(
+        name="my_allgather",
+        collective=xcclpp.language.AllGather(...),
+        nranks_per_node=nranks_per_node,
+        world_size=world_size,
+        in_place=True,
+        instances=nranks_per_node,
+        protocol="Simple",
+        buffer_alignment=16,
+    )
+
+
+def my_allgather(spec):
+    with xcclpp.language.program.CollectiveProgram(
+        spec.name,
+        spec.collective,
+        spec.world_size,
+        instances=spec.instances,
+        protocol=spec.protocol,
+        auto_sync=spec.auto_sync,
+        buffer_alignment=spec.buffer_alignment,
+    ) as program:
+        channels = {}
+
+        # 1. 创建 Channel
+        for src_rank in range(spec.world_size):
+            dst_rank = (src_rank + 1) % spec.world_size
+            channels[(dst_rank, src_rank)] = MemoryChannel(
+                dst_rank=dst_rank,
+                src_rank=src_rank,
+            )
+
+        # 2. 同步就绪
+        for channel in channels.values():
+            channel.signal(...)
+            channel.wait(...)
+
+        # 3. 数据操作
+        for channel in channels.values():
+            channel.put(...)
+
+        # 4. 同步完成
+        for channel in channels.values():
+            channel.signal(...)
+            channel.wait(...)
+
+    return program
+
+
+def init_runtime():
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    nranks_per_node = get_local_device_count()
+
+    comm_group = xcclpp.CommGroup(
+        interfaceIpPortTrio=build_master_endpoint(),
+        rank=rank,
+        size=world,
+    )
+
+    spec = build_spec(world, nranks_per_node)
+    algorithm = xcclpp.compile(
+        algo=my_allgather,
+        algo_spec=spec,
+        rank=rank,
+    )
+
+    executor = xcclpp.Executor(comm_group.communicator)
+    return comm_group, executor, algorithm
+
+
+def run(tensor):
+    comm_group, executor, algorithm = init_runtime()
+
+    algorithm.execute(
+        comm=comm_group.communicator,
+        executor=executor,
+        input_buffer=tensor.data_ptr(),
+        output_buffer=tensor.data_ptr(),
+        input_size=tensor.nbytes,
+        output_size=tensor.nbytes,
+        dtype=to_xcclpp_dtype(tensor.dtype),
+        stream=current_stream_handle(),
+    )
+```
+
+## 21.14 DSL 操作最终如何落到底层数据搬运
+
+以 DSL 中的一次 `MemoryChannel.put()` 为例，可以建立如下映射：
+
+```mermaid
+flowchart TD
+    A[DSL：channel.put<br/>描述 Rank、Offset、长度] --> B[CollectiveProgram 记录操作]
+    B --> C[compile 解析依赖和资源]
+    C --> D[ExecutionPlan 中的 Channel 指令]
+    D --> E[Executor 启动设备端执行]
+    E --> F[构造或取得 Device Handle]
+    F --> G[设备端多线程执行 put]
+    G --> H[Global Load → 寄存器 → 远端 Global Store]
+```
+
+对应关系：
+
+| DSL 概念 | 底层含义 |
+|---|---|
+| `MemoryChannel` | 一组可访问的本地/远端内存和同步资源 |
+| `channel.put()` | 生成一段本地到远端的搬运操作 |
+| `channel.get()` | 生成一段远端到本地的搬运操作 |
+| `signal/wait` | 建立阶段依赖和生产者—消费者关系 |
+| `protocol="LL"` | 可能选择低延迟 Packet/Flag 类协议 |
+| `instances` | 复制多个执行实例以增加流水并行度 |
+| `buffer_alignment` | 约束可使用的访问粒度和搬运效率 |
+| `auto_sync` | 编译阶段自动管理部分依赖，并非取消同步语义 |
+
+重要结论：
+
+> DSL 中写一行 `put()`，不代表硬件只执行一条指令；它代表向执行计划中加入一个数据搬运阶段，运行时可能由多个核、多个线程或专用引擎共同完成。
+
+## 21.15 Simple 与 LL 协议的直观区别
+
+PPT 中 `protocol` 常见值包括 `Simple` 和 `LL`。
+
+可以用前文内容建立直觉：
+
+| 协议思路 | 直观特点 | 更适合的目标 |
+|---|---|---|
+| `Simple` | 主要传输纯 Payload，配合独立同步 | 大块数据、更高 Payload 利用率 |
+| `LL` | Payload 携带 Flag，接收端可细粒度轮询 | 小消息、低延迟、边到达边消费 |
+
+LL 类协议的代价包括：
+
+- Flag 占用带宽；
+- 接收端需要轮询；
+- Buffer 容量按 Packet 存储量计算；
+- Flag 轮次和回绕必须正确管理。
+
+因此协议选择不能只看名称，应结合：
+
+```text
+消息大小
+同步频率
+是否需要流水消费
+有效 Payload 比例
+轮询开销
+链路带宽
+```
+
+## 21.16 `auto_sync` 不等于“不需要考虑同步”
+
+`auto_sync=True` 的合理理解是：
+
+> 编译器根据 DSL 图中的依赖，尝试自动插入或组织它能够识别的同步关系。
+
+它不意味着：
+
+- 任意两个 Buffer 都天然可见；
+- 自定义裸指针操作自动获得 Release/Acquire；
+- 多个生产者可以安全地裸加同一个计数器；
+- 用户可以省略所有阶段边界；
+- 外部 Kernel 和 DSL 内部操作之间自动有正确顺序。
+
+使用者仍需明确：
+
+```text
+谁生产数据？
+谁消费数据？
+依赖是否在同一个 CollectiveProgram 中？
+是否跨 Block、跨核、跨进程或跨设备？
+Signal 前是否保证全部写操作完成？
+Wait 后是否建立所需的可见性？
+```
+
+## 21.17 DSL 调试时应该从哪一层排查
+
+建议按下面顺序定位：
+
+```mermaid
+flowchart TD
+    A[AlgoSpec 是否匹配当前 world_size 和消息大小] --> B[CollectiveProgram 的 Rank、Offset、长度是否正确]
+    B --> C[Channel 类型是否匹配物理拓扑]
+    C --> D[signal/wait 依赖是否闭合]
+    D --> E[compile 生成的 JSON 计划是否符合预期]
+    E --> F[CommGroup 的 Rank 组网是否正确]
+    F --> G[Executor 是否使用正确 Communicator]
+    G --> H[execute 的 Buffer、Size、DType、Stream 是否正确]
+    H --> I[设备端 Kernel、MTE/SDMA/远端访存是否正常]
+```
+
+常见问题：
+
+| 现象 | 优先检查 |
+|---|---|
+| 编译阶段报约束不匹配 | `world_size`、消息范围、`in_place`、协议 |
+| 某些 Rank 永久等待 | Rank 映射、Signal/Wait 配对、Flag 轮次 |
+| 数据写错位置 | Rank、Buffer 类型、Offset、元素数与字节数 |
+| 小消息延迟高 | Channel/协议选择、同步次数、Kernel 启动和轮询 |
+| 大消息带宽低 | Channel 是否匹配拓扑、并发实例、搬运粒度、链路瓶颈 |
+| 重复执行第二轮出错 | Buffer 复用、Flag 回绕、缓存计划与运行参数 |
+| 只有多机失败 | CommGroup Bootstrap、网卡选择、PortChannel/RDMA 配置 |
+
+## 21.18 初学者最终应建立的心智模型
+
+把整个系统想象成物流系统：
+
+```text
+AlgoSpec
+= 这次物流任务的规模、规则和适用范围
+
+CollectiveProgram
+= 物流线路图和每一步操作顺序
+
+Memory/Port/SwitchChannel
+= 公路、专线和带聚合能力的交换枢纽
+
+CommGroup
+= 全部仓库和司机的通讯录
+
+compile
+= 把线路图转换成调度系统能执行的工单
+
+Algorithm
+= 已经编译好的工单模板
+
+Executor
+= 现场调度员
+
+Algorithm.execute
+= 给工单填入本次真实货物地址并开始执行
+
+MemoryChannelDeviceHandle
+= 设备端搬运工手中的具体地址卡和门铃
+```
+
+最重要的分层关系：
+
+```text
+业务接口：all_reduce / all_gather
+        ↓
+Python DSL：AlgoSpec + CollectiveProgram
+        ↓
+编译产物：Algorithm + ExecutionPlan
+        ↓
+运行时：CommGroup + Executor
+        ↓
+设备端：Channel + DeviceHandle + Kernel
+        ↓
+硬件：MTE / SDMA / 远端内存访问 / 交换网络
+```
+
+学习 DSL 时，不要只背 API。始终追问：
+
+```text
+这条 DSL 语句最终创建了什么执行阶段？
+数据的源和目的物理上在哪里？
+它使用哪一种 Channel 和硬件路径？
+完成与可见性由哪个同步关系保证？
+编译器自动做了什么，哪些仍然由用户保证？
+```
+
+回答清楚这些问题，才能真正把 DSL、MemoryChannelDeviceHandle、Packet、MTE/SDMA 和集合通信算法连成一个完整体系。
