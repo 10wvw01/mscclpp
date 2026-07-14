@@ -5,7 +5,7 @@
 > 本文尽量同时做到两点：
 >
 > 1. 保持技术描述准确，便于继续阅读源码和分析性能；
-> 2. 使用通俗类比、流程图和对照表解释 SM、Warp、寄存器、Global Load/Store、Packet、远端显存、MTE/SDMA、同步和上层 DSL。
+> 2. 使用通俗类比、流程图、官方资料和对照表解释 SM、Warp、寄存器、Global Load/Store、Packet、远端显存、MTE/SDMA、同步和上层 DSL。
 
 ---
 
@@ -17,7 +17,7 @@
 - [4. read、write、put、get、putPackets、getPackets 的区别](#4-readwriteputgetputpacketsgetpackets-的区别)
 - [5. put 和 get 的底层 copy 原理](#5-put-和-get-的底层-copy-原理)
 - [6. 什么是 SM、Warp 和 GPU 线程](#6-什么是-smwarp-和-gpu-线程)
-- [7. 为什么一个 Warp 是 32 个线程](#7-为什么一个-warp-是-32-个线程)
+- [7. Warp 为什么是 32 个线程：官方能确认什么](#7-warp-为什么是-32-个线程官方能确认什么)
 - [8. 什么是 GPU 寄存器](#8-什么是-gpu-寄存器)
 - [9. 什么是 Global Load 和 Global Store](#9-什么是-global-load-和-global-store)
 - [10. put 的真实数据路径](#10-put-的真实数据路径)
@@ -259,55 +259,815 @@ Global Load → 本线程寄存器 → Global Store
 
 # 6. 什么是 SM、Warp 和 GPU 线程
 
-## 6.1 SM
-
-SM（Streaming Multiprocessor）是 NVIDIA GPU 执行 Kernel 的主要计算单元，内部包含：
-
-- Warp Scheduler；
-- CUDA Core / ALU；
-- Load/Store Unit；
-- Register File；
-- Shared Memory / L1；
-- 其他专用执行单元。
-
-## 6.2 Warp
-
-Warp 是 NVIDIA GPU 的基本线程调度和执行组，通常由连续的 32 个 CUDA 线程组成：
+初学 GPU 时，最容易把以下概念混在一起：
 
 ```text
-Warp 0：thread 0  ～ thread 31
-Warp 1：thread 32 ～ thread 63
+Thread、Warp、Block、SM、CUDA Core
+```
+
+它们并不处在同一层。可以先记住两条层次关系。
+
+**程序员在代码中看到的组织层次：**
+
+```text
+Kernel
+└── Grid
+    └── Thread Block
+        └── Warp（硬件调度时形成）
+            └── Thread / Lane
+```
+
+**GPU 硬件的简化组织层次：**
+
+```text
+GPU
+└── GPC（Graphics Processing Cluster）
+    └── SM（Streaming Multiprocessor）
+        ├── Warp Scheduler
+        ├── Register File
+        ├── Shared Memory / L1
+        ├── Load/Store Unit
+        └── 各类计算功能单元
+```
+
+二者的关键映射关系是：
+
+```mermaid
+flowchart TD
+    K[Kernel 启动] --> G[Grid：全部 Thread Block]
+    G --> B0[Thread Block 0]
+    G --> B1[Thread Block 1]
+    G --> BN[更多 Thread Block]
+
+    B0 -->|整个 Block 被分配到一个 SM| SM0[SM 0]
+    B1 -->|整个 Block 被分配到一个 SM| SM1[SM 1]
+    BN -->|由硬件调度| SMN[其他 SM]
+
+    SM0 --> W0[Warp 0：Thread 0～31]
+    SM0 --> W1[Warp 1：Thread 32～63]
+    SM0 --> WX[其他驻留 Warp]
+```
+
+> NVIDIA 官方说明：GPU 可以从 CUDA 编程模型角度看成多个 SM 的集合；一个 Thread Block 的全部线程在一个 SM 上执行。官方同时强调，真实硬件内部布局会随架构变化，因此本文使用的是 CUDA 编程模型保证的抽象，而不是假设所有型号内部完全相同。
+>
+> 官方资料：[CUDA Programming Guide — GPU Hardware Model、Thread Blocks and Grids](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#gpu-hardware-model)
+
+## 6.1 GPU Thread：程序员写出的一个逻辑执行实例
+
+假设 Kernel 中有：
+
+```cpp
+int tid = blockIdx.x * blockDim.x + threadIdx.x;
+out[tid] = in[tid] * 2;
+```
+
+可以通俗地理解为：
+
+```text
+每个 Thread 都拿到一个不同的 tid，
+并负责处理自己对应的一个数据位置。
+```
+
+每个 CUDA Thread 从编程模型看具有：
+
+- 自己的线程 ID；
+- 自己的局部变量；
+- 自己的逻辑寄存器状态；
+- 自己的指令执行状态；
+- 自己可以计算出的数据下标。
+
+但需要避免一个常见误区：
+
+> 一个 CUDA Thread 不等于一颗固定的物理“CUDA Core”，也不是从 Kernel 开始到结束一直独占某个算术单元。
+
+Thread 是编程模型中的逻辑工作项。硬件把许多 Thread 组织成 Warp，再由 SM 的调度器把 Warp 指令发送给当前可用的功能单元。
+
+通俗类比：
+
+```text
+Thread = 一张具体工单
+
+工单写着：
+“把第 tid 号货物从 src 搬到 dst。”
+
+工单不是一台机器；
+SM 才是拥有调度员、工具和工作台的车间。
+```
+
+> NVIDIA 官方说明：Kernel Launch 可以理解成让大量线程并行执行同一段 Kernel 代码；每个线程通过内建索引确定自己负责的数据或操作。
+>
+> 官方资料：[CUDA Programming Guide — Heterogeneous Systems、Thread Blocks and Grids](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#thread-blocks-and-grids)
+
+## 6.2 Thread Block：一组必须落在同一个 SM 上的线程
+
+程序启动 Kernel 时会指定：
+
+```cpp
+kernel<<<gridDim, blockDim>>>(...);
+```
+
+其中：
+
+- `gridDim` 决定有多少个 Block；
+- `blockDim` 决定每个 Block 有多少个 Thread。
+
+例如：
+
+```cpp
+kernel<<<80, 256>>>(...);
+```
+
+表示：
+
+```text
+80 个 Thread Block
+× 每个 Block 256 个 Thread
+= 20480 个逻辑 Thread
+```
+
+一个 Block 的全部线程会被分配给同一个 SM。这是因为同一 Block 内的线程需要能够：
+
+- 使用同一块 Shared Memory；
+- 使用 `__syncthreads()` 做 Block 内同步；
+- 高效交换数据。
+
+同一个 SM 可以同时驻留一个或多个 Block，具体数量受以下资源限制：
+
+- 每个 Thread 使用多少寄存器；
+- 每个 Block 使用多少 Shared Memory；
+- 每个 Block 有多少 Thread；
+- 该架构允许的最大驻留 Block、Warp 和 Thread 数量。
+
+通俗类比：
+
+```text
+Block = 一支施工队
+SM    = 一个施工车间
+
+整支施工队必须进入同一个车间，
+因为队员要共用车间里的公告板（Shared Memory），
+还要一起集合（__syncthreads）。
+```
+
+需要注意：
+
+```text
+一个 Block 只会在一个 SM 上执行；
+一个 SM 则可能同时容纳多个 Block。
+```
+
+不同 Block 的调度顺序没有一般性保证，因此普通 Kernel 不能假设 Block 0 一定先于 Block 1 完成。
+
+> NVIDIA 官方说明：一个 Thread Block 的所有线程由单个 SM 执行；一个 SM 可以有一个或多个活跃 Block，不同 Block 的分配顺序没有保证。
+>
+> 官方资料：[CUDA Programming Guide — Thread Blocks and Grids](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#thread-blocks-and-grids)
+
+## 6.3 SM：不是一颗“大 CPU 核”，而是一座并行执行车间
+
+SM 的全称是 Streaming Multiprocessor。
+
+NVIDIA 官方把 GPU 描述为多个 SM 的集合，并说明每个 SM 包含：
+
+- 本地 Register File；
+- Unified Data Cache；
+- Shared Memory 和 L1 所使用的片上资源；
+- 多种执行计算的 Functional Units。
+
+更深入的官方章节还说明：
+
+> 一个 SM 被设计为并发执行数百个线程，并通过 SIMT 和硬件多线程管理它们。
+
+因此不要把 SM 简化成：
+
+```text
+SM = 一颗 CUDA Core
+```
+
+更合理的理解是：
+
+```text
+SM = 调度系统 + 片上存储 + 多种执行单元组成的并行处理器
+```
+
+通俗类比：
+
+```text
+SM 是一座车间：
+
+Warp Scheduler  = 调度员
+Register File   = 每组工人随手可取的工具柜
+Shared Memory   = 同一个 Block 共用的工作台
+Load/Store Unit = 仓库出入库窗口
+功能单元         = 执行整数、浮点、矩阵等工作的机器
+```
+
+车间不是同一时刻只处理一张工单。它会保留许多 Warp 的执行状态，并不断从“当前已经准备好”的 Warp 中选择下一组工作。
+
+> NVIDIA 官方依据：
+>
+> - [CUDA Programming Guide — GPU Hardware Model](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#gpu-hardware-model)
+> - [CUDA Programming Guide — Hardware Implementation](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html#hardware-implementation)
+
+## 6.4 Warp：SM 实际调度 Thread 时使用的 32 线程组
+
+在一个 Thread Block 内，硬件会按照连续、递增的 Thread ID，把线程划分成 Warp：
+
+```text
+Warp 0：Thread 0  ～ Thread 31
+Warp 1：Thread 32 ～ Thread 63
+Warp 2：Thread 64 ～ Thread 95
 ...
 ```
 
-一个 Warp 中的每个线程也称为一个 Lane。
+每个 Warp 包含 32 个 Lane：
 
-## 6.3 SIMT
+```text
+Lane 0 ～ Lane 31
+```
 
-CUDA 对程序员表现为多个独立线程，但硬件把 32 个线程组合成 Warp 执行同一条或同一路径上的指令。这称为 SIMT：Single Instruction, Multiple Threads。
+这里可以这样区分：
 
----
+```text
+Thread = 程序员视角中的逻辑线程
+Lane   = 这个 Thread 在当前 Warp 中的位置
+Warp   = SM 的基本线程调度组
+```
 
-# 7. 为什么一个 Warp 是 32 个线程
-
-32 不是数学定理，而是 NVIDIA 的架构选择，是以下因素的工程折中：
-
-- 指令获取和调度开销；
-- 执行吞吐；
-- 内存访问合并；
-- 分支发散代价；
-- 寄存器和其他资源占用；
-- 延迟隐藏能力。
-
-Warp 太小，调度开销相对变大；Warp 太大，分支发散和资源占用会更严重。NVIDIA 长期选择 32 Lane 作为平衡点。
-
-如果 Block 有 256 个线程，则逻辑上包含：
+例如，一个 Block 有 256 个 Thread：
 
 ```text
 256 / 32 = 8 个 Warp
 ```
 
-Block 大小不是 32 的倍数时，最后一个 Warp 会有部分 Lane 不工作。
+```mermaid
+flowchart TD
+    B[一个 256 Thread 的 Block]
+    B --> W0[Warp 0<br/>Thread 0～31]
+    B --> W1[Warp 1<br/>Thread 32～63]
+    B --> W2[Warp 2<br/>Thread 64～95]
+    B --> WD[...]
+    B --> W7[Warp 7<br/>Thread 224～255]
+```
+
+> NVIDIA 官方说明：SM 以 32 个并行 Thread 为一组创建、管理、调度和执行 Warp；Block 被划分为 Warp 时，每个 Warp 包含连续递增的 Thread ID，第一个 Warp 从 Thread 0 开始。
+>
+> 官方资料：[CUDA Programming Guide — SIMT Execution Model、Hardware Multithreading](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html#simt-execution-model)
+
+## 6.5 SIMT：同一条指令，多条逻辑线程
+
+SIMT 是 Single-Instruction, Multiple-Thread。
+
+初学者可以先把它理解成：
+
+```text
+Warp 中的 32 个 Thread 通常共同推进同一段 Kernel 代码，
+但每个 Thread 仍然拥有自己的数据、寄存器状态和逻辑身份。
+```
+
+例如：
+
+```cpp
+out[tid] = in[tid] + 1;
+```
+
+某个 Warp 执行这条语句时，可以概念化为：
+
+```text
+Lane 0 处理 in[base + 0]
+Lane 1 处理 in[base + 1]
+Lane 2 处理 in[base + 2]
+...
+Lane 31 处理 in[base + 31]
+```
+
+它和传统 SIMD 的共同点是：
+
+```text
+一条指令控制多个并行处理位置。
+```
+
+区别是 CUDA 仍然向程序员提供独立 Thread 的语义：
+
+- 每个 Thread 有自己的索引；
+- 每个 Thread 可访问不同地址；
+- 每个 Thread 可以做不同的分支选择；
+- 每个 Thread 有独立的寄存器和执行状态。
+
+因此不能把 SIMT 简单等同于“一个固定宽度的 C++ 向量变量”。
+
+> NVIDIA 官方说明：Warp 执行同一段 Kernel 代码，但 SIMT 允许线程拥有自己的控制流；这正是 SIMT 与传统 SIMD 暴露固定向量宽度的模型之间的重要区别。
+>
+> 官方资料：[CUDA Programming Guide — Warps and SIMT](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#warps-and-simt)
+
+### 关于 Volta 之后的 Independent Thread Scheduling
+
+Compute Capability 7.0 及之后支持 Independent Thread Scheduling，硬件可以维护更细粒度的每线程执行状态，并在子 Warp 粒度重组活跃线程。
+
+但这不表示：
+
+```text
+Warp 已经不存在
+或
+每个 Thread 都完全变成类似 CPU Thread 的独立调度单位
+```
+
+Warp 仍然是重要的执行和性能组织单位。旧代码如果依赖“Warp 内永远隐式锁步”，应使用 `__syncwarp()` 等显式同步重新检查正确性。
+
+> NVIDIA 官方资料：[CUDA Programming Guide — Independent Thread Scheduling](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html#independent-thread-scheduling)
+
+## 6.6 Warp Scheduler：为什么等待内存时 GPU 不一定停下来
+
+一个 SM 通常同时保留多个驻留 Warp。
+
+可以想象当前 SM 中有：
+
+```text
+Warp 0：等待 Global Load 返回
+Warp 1：下一条算术指令已就绪
+Warp 2：等待某个依赖
+Warp 3：下一条 Store 已就绪
+```
+
+Warp Scheduler 可以选择一个当前 Ready 的 Warp 发射下一条指令：
+
+```mermaid
+flowchart TD
+    A[SM 中有多个驻留 Warp] --> B{哪个 Warp 已就绪?}
+    B -->|Warp 0 等内存| W0[暂时不发射 Warp 0]
+    B -->|Warp 1 Ready| W1[发射 Warp 1 下一条指令]
+    B -->|Warp 3 Ready| W3[后续周期可发射 Warp 3]
+    W1 --> B
+    W3 --> B
+```
+
+这就是常说的“用其他 Warp 隐藏延迟”。
+
+通俗类比：
+
+```text
+一组工人在等远端仓库送货时，
+调度员不会站着一起等；
+他会让另一组已经拿到材料的工人继续工作。
+```
+
+NVIDIA 官方说明了两个关键事实：
+
+1. Warp 的程序计数器、寄存器等执行上下文在其生命周期内保留在片上；
+2. Warp Scheduler 在指令发射周期选择已准备好执行下一条指令的 Warp。
+
+因此官方文档将 Warp 切换描述为不需要类似 CPU 操作系统线程那样的上下文换入换出成本。
+
+但需要准确理解：
+
+> “Warp 切换无额外上下文切换成本”不等于任何 Kernel 都能完全隐藏延迟。还必须有足够多的 Ready Warp，并且寄存器、Shared Memory、依赖关系和访存并发允许这些 Warp 同时驻留和推进。
+
+> NVIDIA 官方依据：
+>
+> - [CUDA Programming Guide — Hardware Multithreading](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html#hardware-multithreading)
+> - [CUDA Best Practices Guide — Occupancy](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy)
+
+## 6.7 Occupancy：SM 中“有多少可用 Warp”，但不是越高越好
+
+Occupancy 通常定义为：
+
+```text
+当前 SM 的 Active Warp 数
+÷
+该 SM 理论允许的最大 Active Warp 数
+```
+
+它反映 SM 的 Warp 容量被使用了多少。
+
+低 Occupancy 往往意味着：
+
+```text
+当少数 Warp 因内存或数据依赖暂停时，
+SM 可能没有足够多的其他 Ready Warp 可以调度。
+```
+
+但高 Occupancy 不自动等于高性能。原因包括：
+
+- 带宽可能已经饱和；
+- 更多 Warp 可能并不能增加有效 Outstanding 请求；
+- 为了提高 Occupancy 强行减少寄存器，可能引发 Spill；
+- 某些 Kernel 可以用较高的指令级并行度覆盖延迟；
+- 算法瓶颈可能不在延迟隐藏。
+
+通俗类比：
+
+```text
+车间里多安排几支施工队，通常能减少等待；
+但车间已经挤满、仓库窗口已经满负荷后，
+继续塞人不一定更快。
+```
+
+> NVIDIA 官方明确提醒：较低 Occupancy 会影响隐藏内存延迟的能力，但更高 Occupancy 并不总是带来更高性能。
+>
+> 官方资料：[CUDA Best Practices Guide — Occupancy](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy)
+
+## 6.8 Warp Divergence：同一个 Warp 走不同分支会发生什么
+
+考虑：
+
+```cpp
+if ((threadIdx.x & 1) == 0) {
+  do_even_work();
+} else {
+  do_odd_work();
+}
+```
+
+一个 Warp 中：
+
+```text
+Lane 0、2、4、... 走 even 分支
+Lane 1、3、5、... 走 odd 分支
+```
+
+概念上硬件需要分别推进两条路径：
+
+```mermaid
+flowchart TD
+    W[一个 Warp 到达 if/else] --> E[执行 even 路径<br/>odd Lane 暂时 Mask]
+    E --> O[执行 odd 路径<br/>even Lane 暂时 Mask]
+    O --> R[重新汇合后继续]
+```
+
+这叫 Warp Divergence。
+
+重要边界：
+
+- Divergence 的性能影响发生在同一个 Warp 内；
+- 不同 Warp 走不同代码路径没有这种“同 Warp Lane 被 Mask”的问题；
+- 分支并不天然很慢，关键看同一 Warp 内是否发生数据相关的路径分歧；
+- 边界判断只影响最后少量 Lane 时，代价可能很小；
+- 长时间、复杂的分歧路径通常更值得关注。
+
+> NVIDIA 官方说明：当 Warp 内线程选择不同分支时，Warp 会执行各条被选择的路径，并禁用当前不在该路径上的线程；完整效率出现在 32 个线程同意执行路径时。
+>
+> 官方资料：[CUDA Programming Guide — SIMT Execution Model](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html#simt-execution-model)
+
+## 6.9 Warp Coalescing：32 个小访问怎样变成高效内存事务
+
+考虑一个 Warp 的 32 个线程都读取一个 `float`：
+
+```cpp
+float value = src[base + laneId];
+```
+
+逻辑上是：
+
+```text
+32 个 Thread × 每个 4B = 128B 有效数据
+```
+
+对 Compute Capability 6.0 及之后的通用规则，Global Memory 访问按所需的 32B 段组织。连续、对齐的 32 个 `float` 通常可由：
+
+```text
+4 个 32B Memory Transaction
+```
+
+覆盖。
+
+```mermaid
+flowchart LR
+    W[一个 Warp<br/>32 个连续 4B Load] --> T0[32B Transaction 0]
+    W --> T1[32B Transaction 1]
+    W --> T2[32B Transaction 2]
+    W --> T3[32B Transaction 3]
+```
+
+如果 32 个线程访问非常分散的地址，硬件可能需要更多事务，取回的大量字节也可能没有被真正使用。
+
+因此 Coalescing 的核心不是：
+
+```text
+把 32 条 C++ 语句魔法般变成一条 128B 指令
+```
+
+而是：
+
+```text
+Warp 的地址分布允许内存系统用尽可能少的 Transaction
+满足这 32 个 Lane 的请求。
+```
+
+NVIDIA 官方将 Global Memory Coalescing 列为高优先级优化，并明确说明 Warp 中线程的 Global Load/Store 会被合并为尽可能少的事务。
+
+> 官方资料：
+>
+> - [CUDA Programming Guide — Coalesced Global Memory Access](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#coalesced-global-memory-access)
+> - [CUDA Best Practices Guide — Coalesced Access to Global Memory](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory)
+
+## 6.10 把这些概念放回 MemoryChannel 的 copy 代码
+
+再次看：
+
+```cpp
+for (size_t i = threadId; i < numElems; i += numThreads) {
+  reg = src[i];
+  dst[i] = reg;
+}
+```
+
+假设：
+
+- `threadId` 是连续的全局线性线程 ID；
+- `T = longlong2`，每个元素 16B；
+- `src` 和 `dst` 满足适当对齐；
+- 同一个 Warp 中的线程都进入当前循环迭代。
+
+那么第一次迭代中：
+
+```text
+Lane 0 访问元素 0
+Lane 1 访问元素 1
+...
+Lane 31 访问元素 31
+```
+
+下一次迭代：
+
+```text
+Lane 0 访问元素 numThreads + 0
+Lane 1 访问元素 numThreads + 1
+...
+Lane 31 访问元素 numThreads + 31
+```
+
+同一个 Warp 的 Lane 在每一轮访问连续元素，所以具备形成高效合并访存的基本地址模式。
+
+对于 `longlong2`：
+
+```text
+每个 Thread：16B
+一个 Warp：32 × 16B = 512B 逻辑数据范围
+```
+
+但是必须保持专业表述：
+
+> 512B 是一个 Warp 在该条访问指令上的逻辑有效数据总量，不代表底层一定只有一个 512B 总线事务。实际事务数量由地址分布、对齐、缓存、目标内存和具体架构共同决定。
+
+在 `put()` 中：
+
+```text
+Warp 从本地 src_ 读取连续数据
+→ 每个 Thread 的值进入自己的寄存器
+→ Warp 向远端 dst_ 写连续数据
+```
+
+在 `get()` 中：
+
+```text
+Warp 从远端 dst_ 读取连续数据
+→ 数据返回各 Thread 寄存器
+→ Warp 向本地 src_ 写连续数据
+```
+
+这也是为什么理解 Warp 不能只停留在“32 个线程”这句话上。它同时影响：
+
+- SM 如何调度工作；
+- 内存请求如何合并；
+- 如何隐藏远端访问延迟；
+- 分支是否浪费 Lane；
+- Block Size 是否浪费最后一个 Warp；
+- 寄存器和 Shared Memory 是否限制驻留 Warp 数量。
+
+## 6.11 初学者术语表
+
+| 术语 | 专业含义 | 通俗理解 |
+|---|---|---|
+| Thread | Kernel 的一个逻辑执行实例 | 一张具体工单 |
+| Lane | Thread 在 Warp 中的编号 0～31 | 工人在本小组中的座位号 |
+| Warp | 32 个 Thread 组成的调度和执行组 | 一组共同推进工作的 32 名工人 |
+| Thread Block | 可同步、可共享 Shared Memory 的线程组 | 必须进入同一个车间的施工队 |
+| SM | 管理和执行大量 Warp 的并行处理器 | 有调度员、工具柜和多种机器的车间 |
+| Resident Warp | 执行状态和资源已经驻留在 SM 上的 Warp | 已进入车间等待或工作的队伍 |
+| Active Thread | 当前 Warp 指令中实际参与的 Lane | 当前这道工序正在干活的人 |
+| Warp Divergence | 同 Warp 的线程走不同控制流路径 | 同组人被迫分批完成不同工序 |
+| Coalescing | 将 Warp 的地址请求组织为较少内存事务 | 把相邻小件合并成少量整车运输 |
+| Occupancy | Active Warp 与硬件最大 Warp 容量的比例 | 车间的队伍容量使用率 |
+
+---
+
+# 7. Warp 为什么是 32 个线程：官方能确认什么
+
+这一问题需要严格区分：
+
+```text
+NVIDIA 官方明确规定的事实
+和
+根据硬件行为作出的工程解释
+```
+
+## 7.1 官方能够直接确认的事实
+
+NVIDIA CUDA Programming Guide 明确说明：
+
+1. SM 以 Warp 为单位创建、管理、调度和执行线程；
+2. 每个 Warp 是 32 个线程；
+3. Warp Lane 编号为 0～31；
+4. Block 被划分为 Warp 时，线程 ID 连续递增；
+5. Warp 数量按向上取整计算；
+6. Block Thread 数不是 32 的倍数时，最后一个 Warp 会存在未使用 Lane。
+
+公式为：
+
+```text
+Warps per Block = ceil(Threads per Block / 32)
+```
+
+官方资料：
+
+- [CUDA Programming Guide — Warps and SIMT](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#warps-and-simt)
+- [CUDA Programming Guide — Hardware Multithreading](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html#hardware-multithreading)
+
+## 7.2 官方没有给出一条“为什么恰好是 32”的唯一推导公式
+
+旧版文字容易写成：
+
+```text
+NVIDIA 因为调度开销、分支发散、寄存器和访存折中，
+所以精确计算后选择了 32。
+```
+
+这种表述听起来合理，但它并不是 CUDA Programming Guide 给出的正式因果推导。
+
+更准确的说法是：
+
+> Warp Size = 32 是当前 CUDA 编程模型和 NVIDIA GPU 架构向程序员提供的硬件契约。官方文档详细说明了 32 线程 Warp 对调度、分支、资源驻留和访存合并的影响，但没有公开一条可以从若干参数唯一推导出“必须等于 32”的通用公式。
+
+因此本文不会把未经官方文档确认的历史设计原因写成确定事实。
+
+## 7.3 可以作出的专业工程解释，但必须标明它是解释
+
+虽然官方没有公布唯一推导，但从官方描述的行为可以看出，Warp Size 会同时影响：
+
+- 一条 Warp 指令覆盖多少 Lane；
+- Block 被切分成多少调度组；
+- 分支发散时可能被 Mask 的 Lane 数量；
+- 一条 Load/Store 需要处理多少线程地址；
+- Register File 如何在驻留 Warp 之间分配；
+- SM 需要维护多少 Warp 上下文；
+- 需要多少 Active Warp 才能隐藏延迟。
+
+这说明 Warp 宽度确实是一个贯穿调度、执行和内存系统的架构参数。
+
+但下面这句话属于**工程解释**，不是 NVIDIA 官方原句：
+
+> 32 可以理解为 NVIDIA 架构长期采用的一种并行粒度选择，它在执行宽度、线程级并行、分支利用率、资源管理和内存访问组织之间形成了一个具体设计点。
+
+这里应避免进一步声称：
+
+```text
+16 一定太小
+64 一定太大
+或
+32 对所有硬件都是理论最优值
+```
+
+AMD GPU、CPU SIMD、NPU Vector 单元可以采用不同执行宽度，这本身就说明 32 不是普适数学常数。
+
+## 7.4 为什么 Block Size 通常选择 32 的倍数
+
+NVIDIA 官方建议 Block 的 Thread 数通常使用 32 的倍数，原因非常直接：避免最后一个 Warp 长期存在无效 Lane，并有利于内存访问组织。
+
+| Block Thread 数 | 分配的 Warp 数 | 总 Lane 容量 | 未使用 Lane |
+|---:|---:|---:|---:|
+| 1 | 1 | 32 | 31 |
+| 31 | 1 | 32 | 1 |
+| 32 | 1 | 32 | 0 |
+| 33 | 2 | 64 | 31 |
+| 64 | 2 | 64 | 0 |
+| 128 | 4 | 128 | 0 |
+| 256 | 8 | 256 | 0 |
+
+例如 Block Size 为 33：
+
+```text
+Warp 0：Thread 0～31，32 个有效 Lane
+Warp 1：只有 Thread 32，另外 31 个 Lane 没有对应 Thread
+```
+
+```mermaid
+flowchart TD
+    B[Block：33 Threads] --> W0[Warp 0<br/>32 个有效 Lane]
+    B --> W1[Warp 1<br/>1 个有效 Lane + 31 个空 Lane]
+```
+
+这并不表示 33 Thread 的 Block 不能运行，只是通常会浪费最后一个 Warp 的部分执行和访存能力。
+
+> NVIDIA 官方资料：
+>
+> - [CUDA Programming Guide — Warps and SIMT](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html#warps-and-simt)
+> - [CUDA Best Practices Guide — Thread and Block Heuristics](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#thread-and-block-heuristics)
+
+## 7.5 为什么不能只说“32 个线程同时执行，所以就是 32 倍性能”
+
+以下推导是错误的：
+
+```text
+一个 Warp 有 32 个线程
+→ 所有操作固定得到 32 倍加速
+```
+
+实际性能还取决于：
+
+- 有多少 Lane 是 Active；
+- 是否发生 Warp Divergence；
+- 地址是否可以高效 Coalescing；
+- 指令使用的功能单元吞吐；
+- 是否存在数据依赖；
+- 是否有足够 Resident Warp 隐藏延迟；
+- Register 和 Shared Memory 是否限制 Occupancy；
+- HBM、NVLink 或 PCIe 是否已经饱和。
+
+例如：
+
+```text
+32 个 Lane 都发 Load
+```
+
+不等于：
+
+```text
+32 个 Load 都立即完成
+```
+
+Warp 可以快速产生一组地址请求，但请求还要经过缓存、内存分区、互联和目标 HBM。
+
+## 7.6 Warp Size 对 MemoryChannel 搬运的实际意义
+
+`MemoryChannelDeviceHandle` 的 `copy()` 使用每线程分片：
+
+```cpp
+for (size_t i = threadId; i < numElems; i += numThreads) {
+  reg = src[i];
+  dst[i] = reg;
+}
+```
+
+当 `T = longlong2` 时：
+
+```text
+1 Thread：16B
+1 Warp：32 × 16B = 512B 逻辑有效数据
+```
+
+Warp Size = 32 在这里至少影响四件事。
+
+### 7.6.1 连续地址范围
+
+同一 Warp 的 32 个 Thread 在同一轮访问连续的 32 个 `longlong2`：
+
+```text
+元素 base + 0 ～ base + 31
+```
+
+逻辑覆盖 512B 连续地址范围。
+
+### 7.6.2 内存事务组织
+
+硬件根据这 32 个 Lane 的地址，生成满足它们所需的若干 Memory Transaction。
+
+```text
+512B 逻辑 Payload
+≠ 必然一个 512B Transaction
+```
+
+实际事务数量受对齐、地址段、缓存和架构影响。
+
+### 7.6.3 延迟隐藏
+
+远端 NVLink/PCIe P2P 访问可能具有较高延迟。一个 Warp 等待时，SM 需要调度其他 Ready Warp，才能继续填充链路和隐藏等待时间。
+
+### 7.6.4 资源占用
+
+更多 Warp 需要更多寄存器和其他 SM 资源。若每 Thread 寄存器使用太高，能够同时驻留的 Warp 变少，远端访存延迟可能更难隐藏。
+
+所以最准确的总结是：
+
+> `longlong2` 提供每 Thread 16B 的访问粒度；Warp 提供 32 Lane 的请求组织；多个 Active Warp 和多个 SM 提供持续并发；地址连续和对齐决定这些请求能否高效使用内存与互联事务。
+
+## 7.7 官方资料索引
+
+本节和第 6 节主要依据以下 NVIDIA 官方文档：
+
+1. [CUDA Programming Guide — Programming Model](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html)
+   - GPU Hardware Model；
+   - Thread Blocks and Grids；
+   - Warps and SIMT。
+2. [CUDA Programming Guide — Advanced Kernel Programming](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html)
+   - Hardware Implementation；
+   - SIMT Execution Model；
+   - Independent Thread Scheduling；
+   - Hardware Multithreading。
+3. [CUDA Programming Guide — Coalesced Global Memory Access](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#coalesced-global-memory-access)
+4. [CUDA Best Practices Guide — Coalesced Access to Global Memory](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory)
+5. [CUDA Best Practices Guide — Occupancy](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy)
+6. [CUDA Best Practices Guide — Thread and Block Heuristics](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#thread-and-block-heuristics)
+
+这些链接用于佐证本文中的术语、执行模型和性能规则。文中的“车间、施工队、工单、运输”等只是帮助初学者理解的类比，不是 NVIDIA 官方术语；每个类比旁边都给出了对应的专业概念和官方资料。
 
 ---
 
@@ -1296,6 +2056,18 @@ GM
 
 错误。DSL 能降低编程门槛，但对齐、缓冲区容量、Channel 选择、同步依赖和硬件拓扑仍然决定正确性与性能。
 
+## 误区 12：一个 CUDA Thread 就对应一颗固定 CUDA Core
+
+错误。Thread 是逻辑执行实例，硬件以 Warp 为主要调度组，由 SM 把 Warp 指令发射给可用功能单元。
+
+## 误区 13：Warp 的 32 个 Thread 必然一直严格锁步
+
+不完整。SIMT 编程模型仍以 Warp 共同推进为基础，但 Compute Capability 7.0 之后支持 Independent Thread Scheduling；依赖隐式 Warp 同步的代码需要使用明确的 Warp 同步原语。
+
+## 误区 14：32 × 16B 等于一次 512B 硬件事务
+
+错误。512B 是一个 Warp 的逻辑有效访问总量，实际会被组织成若干内存事务，数量取决于地址、对齐、缓存和架构。
+
 ---
 
 # 19. 性能分析建议
@@ -1331,11 +2103,14 @@ GM
 - 有效链路吞吐；
 - Payload Goodput；
 - SM Occupancy；
+- Active/Eligible Warp 数量；
 - 寄存器数量；
 - Register Spill；
 - Warp Stall 原因；
+- Branch Efficiency；
 - Memory Dependency Stall；
-- Global Load/Store 效率；
+- Global Load/Store Efficiency；
+- 每个 Warp 的内存事务数量；
 - L2 吞吐；
 - NVLink Tx/Rx；
 - PCIe P2P 带宽；
@@ -1407,10 +2182,14 @@ Packet 路径最关键的地址关系是：
 
 其中：
 
-- SM 是执行 Kernel 的计算单元；
-- Warp 是 NVIDIA 调度的 32 线程基本单位；
-- 每个线程拥有自己的逻辑寄存器；
-- 寄存器位于当前 GPU SM；
+- Thread 是 Kernel 的逻辑执行实例，不是固定物理核心；
+- 一个 Block 的全部线程由同一个 SM 执行；
+- SM 是包含调度、寄存器、缓存和多种功能单元的并行处理器；
+- Warp 是 NVIDIA 以 32 Thread 组成的调度和执行组；
+- Warp Scheduler 通过选择 Ready Warp 帮助隐藏访存和数据依赖延迟；
+- 分支发散会让同 Warp 的不同路径分阶段执行；
+- 连续地址使 Warp 的 Global Load/Store 能够合并为较少事务；
+- 每个线程拥有自己的逻辑寄存器，物理资源位于当前 GPU SM；
 - Global Load/Store 可访问本地或映射后的远端地址；
 - 高带宽依赖 Warp 合并访存和大量并发请求；
 - Packet 用 Payload + Flag 实现细粒度到达和轮次检测；
@@ -1423,7 +2202,7 @@ Packet 路径最关键的地址关系是：
 
 一句话概括：
 
-> 普通 MemoryChannel 用大量 Warp 把 Load/Store 变成高并发数据流；Packet Channel 在同一条远端写入链路上加入 Flag；DSL 再把这些底层能力组合成可复用的集合通信算法。
+> 普通 MemoryChannel 依靠 SM 中多个 Warp 持续产生并组织 Load/Store 请求；Packet Channel 在同一条远端写入链路上加入 Flag；DSL 再把这些底层能力组合成可复用的集合通信算法。
 
 ---
 
